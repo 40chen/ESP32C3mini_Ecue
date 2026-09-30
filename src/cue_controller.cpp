@@ -366,9 +366,11 @@ void runPiezoEffect() {
         }
         break;
       }
-      case 2: {   // S2 力度→长度条：中心对称 N=8/16/30，条内均匀公共衰减
-        const int half = STYLE_S2_BAR[effectIntensity] / 2;   // 4/8/15
-        if (distance <= half) {
+      case 2: {   // S2 力度→长度条：N=8/16/30，从 from 起向右铺（8 灯=11..18，同 M1 击打口径）
+        const int span = STYLE_S2_BAR[effectIntensity];       // 8/16/30
+        const int from = center - span / 2;                   // 11/7/0
+        const int to = from + span - 1;                       // 18/22/29
+        if (index >= from && index <= to) {
           pixels.setPixelColor(index, dimColor(effectColor, pulse));
         }
         break;
