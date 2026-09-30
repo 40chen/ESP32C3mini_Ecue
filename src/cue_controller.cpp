@@ -508,6 +508,19 @@ void cueControllerSetup() {
 }
 
 void cueControllerLoop() {
+  // P1-2 竞态修复（20260930 交叉复核发现）：窗口期只采样，无按键无渲染。
+  // 若窗口内放行按键，btn2 释放沿会触发 enterPresetMode/enterStandby：
+  // 其 clearPixels() 直接 show() 违反"窗口期禁止一切 show()"（细节B），
+  // 且 mode≠Sensor 后引擎门控停转、piezoInWindow 无人关闭，
+  // 下方渲染仲裁被永久跳过（预设蓝闪/五效果/渐灭全部卡死）。
+  // 窗口最长 30ms，按键与渲染延后一个窗口，人手不可感（消抖 40ms 更不受影响）。
+  if (piezoInWindow) {
+    if (mode == RuntimeMode::Sensor) {
+      handlePiezoSensor();                          // 引擎照常全速采样/关窗/记录撞击
+    }
+    return;
+  }
+
   handleButtons();                                  // 闪/渐灭期间扫描照常
 
   if (mode == RuntimeMode::Sensor) {
@@ -515,9 +528,6 @@ void cueControllerLoop() {
   }
 
   // ---- 渲染仲裁 ----
-  if (piezoInWindow) {
-    return;                                         // P1-2/细节B：窗口期跳过一切 show()
-  }
   if (fadeActive) {
     fadeRenderFrame();
     return;
