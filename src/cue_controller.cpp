@@ -1,18 +1,21 @@
 #include <Arduino.h>
 #include <Adafruit_NeoPixel.h>
+#include <Preferences.h>
 
 #include "cue_controller.h"
 #include "piezo_config.h"
 
 // =====================================================================
-// ECUE 运行时双模式固件（M1）
+// ECUE 运行时双模式固件（M2）
 //
 // 模式：传感器（压电引擎+撞击响应）/ 预设灯效（五效果循环）/ 待机（全灭）
 // 按键：btn2(IO10) 短按互切模式、长按 2s 待机；
-//       btn1(IO0)  预设模式内循环效果（传感器模式 M1 无动作，风格切换留 M2；
-//                  长按语义已预留，现场重标定随 M3 落地）。
+//       btn1(IO0)  传感器模式内循环撞击风格（M2）/ 预设模式内循环效果（M1）；
+//                  长按语义已预留，现场重标定随 M3 落地。
 // 待机中任意短按唤醒回传感器模式。
-// 交互口径见《ECUE_交互规范_设计匠人_20260930》V1；参数见 piezo_config.h。
+// 开机：恒进预设灯效模式（C 语义，V2 §5.6），NVS 恢复 effect/style 档位
+//       索引（§5.5），开机无确认闪——灯效即反馈。
+// 参数见 piezo_config.h；交互口径见《ECUE_交互规范_设计匠人_20260930》V2。
 // =====================================================================
 
 namespace {
@@ -26,17 +29,15 @@ enum class RuntimeMode : uint8_t {
   Standby   // 待机：全灭
 };
 
-#if defined(APP_MODE_BOOT_PRESET)
-RuntimeMode mode = RuntimeMode::Preset;       // 可选：开机进预设灯效模式
-#else
-RuntimeMode mode = RuntimeMode::Sensor;       // 开机默认=传感器模式
-#endif
+RuntimeMode mode = RuntimeMode::Sensor;       // 真实开机模式由 setup 内 enterPresetMode
+                                              // 设定（V2 §5.6，唯一非按键调用点）
 
 constexpr bool DEBUG_IMPACT = true;           // 触发时打印 swing，标定完可改 false
 
 uint8_t presetIndex = 0;                      // 预设域档位记忆（来回切模式不重置）
 constexpr uint8_t PRESET_COUNT = 5;           // 五效果，无黑档；Off 语义移交 btn2 长按
 uint32_t lastPresetUpdate = 0;                // 预设效果 25ms 渲染节流
+uint8_t styleIndex = 0;                       // 传感器域撞击风格档位（M2 四态循环）
 
 // ---- 压电引擎状态 ----
 uint32_t piezoLastPollUs = 0;
@@ -141,6 +142,42 @@ void resetPresetState() {
   strikeNextAt = 0;
 }
 
+// ---- NVS 断电记忆（V2 §5.5）----
+// 单 key 三字段打包（effect/style/mode）。mode 为保留字段：写侧恒写 0、读侧
+// 忽略（C 语义开机恒进预设，mode 不参与恢复；字段保留为未来语义回摆预埋，
+// 回摆零迁移成本）。写点仅 handleButtons 内档位变更处（P1-2 修复后
+// handleButtons 只在窗口外被调，满足"写点窗口门外"冻结纪律）。
+struct NvState {
+  uint8_t effect;   // presetIndex（预设域档位）
+  uint8_t style;    // styleIndex（传感器域档位）
+  uint8_t mode;     // 保留字段，恒写 0，读侧不使用
+};
+
+void saveImpactState() {
+  if (!NVS_ENABLED) return;
+  const NvState s{presetIndex, styleIndex, 0};   // mode 恒写 0（V2 §5.5）
+  Preferences prefs;
+  prefs.begin(NVS_NS, false);
+  prefs.putBytes(NVS_KEY, &s, sizeof(s));
+  prefs.end();
+}
+
+void loadImpactState() {
+  presetIndex = 0;
+  styleIndex = 0;
+  if (!NVS_ENABLED) return;
+  Preferences prefs;
+  prefs.begin(NVS_NS, true);                     // 只读打开；NVS 不存在时读出空
+  NvState s{0, 0, 0};
+  if (prefs.getBytesLength(NVS_KEY) == sizeof(s)) {
+    prefs.getBytes(NVS_KEY, &s, sizeof(s));
+  }
+  prefs.end();
+  // 越界回退默认档（冻结纪律）
+  presetIndex = (s.effect < PRESET_COUNT) ? s.effect : 0;
+  styleIndex = (s.style < STYLE_COUNT) ? s.style : 0;
+}
+
 // ---- 确认闪 ----
 void startConfirmFlash(uint32_t color) {
   flashColor = color;
@@ -204,13 +241,17 @@ void enterSensorMode() {
   startConfirmFlash(pixels.Color(0, 200, 80));               // 绿闪（与静默并行）
 }
 
-void enterPresetMode() {
+// withFlash=false 用于开机初始化（V2 §5.6：开机无确认闪，灯效即反馈）；
+// 入模动作（清灯/复位/亮度恢复）与按键路径完全一致，仅反馈不同。
+void enterPresetMode(bool withFlash = true) {
   fadeActive = false;
   mode = RuntimeMode::Preset;
   pixels.setBrightness(LED_BRIGHTNESS_MAX);
   clearPixels();
   resetPresetState();
-  startConfirmFlash(pixels.Color(40, 120, 255));             // 蓝闪
+  if (withFlash) {
+    startConfirmFlash(pixels.Color(40, 120, 255));           // 蓝闪
+  }
 }
 
 void enterStandby() {
@@ -465,8 +506,9 @@ void handleButtons() {
       presetIndex = (presetIndex + 1) % PRESET_COUNT;
       resetPresetState();
       lastPresetUpdate = 0;                         // 新效果立即渲染
+      saveImpactState();                            // V2 §5.5 写点：档位变更即落 NVS
     }
-    // 传感器模式：M1 无动作（撞击风格切换留 M2，范围口径见冻结文档 §五#5）
+    // 传感器模式：风格切换随 M2 三风格落地（见 handleButtons M2 版本）
   }
   // btn1 长按：键位语义预留（M3 现场重标定入口），M1 不实现
 }
@@ -491,20 +533,20 @@ void cueControllerSetup() {
   pixels.setBrightness(LED_BRIGHTNESS_MAX);         // 亮度帽（§2.6，USB 供电安全值）
   clearPixels();
 
-  // 静息电平初始化：64 次平均，比单次读数抗噪（交接时用 32 次重播种）
-  uint32_t restSum = 0;
-  for (int i = 0; i < 64; ++i) {
-    restSum += analogRead(PIEZO_ADC_PIN);
-    delay(2);
-  }
-  piezoRest = restSum / 64;
+  // V2 §5.6：M1 的上电 64 次静息初始化已移除——开机恒进预设模式，引擎不触达；
+  // 传感器基线一律走 btn2 交接链（enterSensorMode → reseedRest，32 次均值）。
+  // V2 §5.5：开机恢复 effect/style 档位索引（越界回退默认档）。
+  loadImpactState();
 
   Serial.println();
-  Serial.println(F("[ecue] runtime firmware ready"));
-  Serial.println(F("[ecue] btn2 = mode switch (hold 2s = standby) | btn1 = cycle presets"));
-  Serial.printf("[ecue] boot mode = %s | LED_BRIGHTNESS_MAX = %u\n",
-                (mode == RuntimeMode::Sensor) ? "sensor" : "preset",
-                LED_BRIGHTNESS_MAX);
+  Serial.println(F("[ecue] runtime firmware ready (M2)"));
+  Serial.println(F("[ecue] boot -> preset mode (C semantics) | NVS restore effect/style"));
+  Serial.printf("[ecue] effect=%u style=%u | LED_BRIGHTNESS_MAX = %u\n",
+                presetIndex, styleIndex, LED_BRIGHTNESS_MAX);
+
+  // C 语义（V2 §5.6）：开机恒进预设灯效模式——enterPresetMode 本体（含全部
+  // 入模动作）作为唯一非按键调用点，开机初始化恰一次；无确认闪，灯效即反馈。
+  enterPresetMode(false);
 }
 
 void cueControllerLoop() {
