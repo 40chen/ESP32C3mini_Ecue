@@ -53,8 +53,18 @@ constexpr uint16_t STYLE_S3_SPEED_MPS[3] = {60, 90, 120};  // S3 波纹扩散波
 constexpr uint32_t IMPACT_BASE_MS = 220;        // 撞击响应时长 = 220 + 70 × level（M1 现状，公共）
 constexpr uint32_t IMPACT_LEVEL_MS = 70;
 
-// ---- M2 风格切换提示（V2 §5.4，默认演示版、可砍不阻塞）----
-constexpr uint32_t STYLE_HINT_FLASHES = 1;      // 演示版：切换时单闪提示
+// ---- M2 风格切换提示（V2 §5.4，微缩演示版；降级/砍掉由复核方裁决，裁决前按此落码）----
+// 状态 0=绿闪 RGB(0,150,70) 60ms；S1=白闪 60ms（复用确认闪 FSM，单闪）；
+// S2/S3=复用各自渲染分支的合成触发，时长如下：
+constexpr uint32_t STYLE_HINT_S2_MS = 200;      // S2 迷你条快速衰减上限（规范 ≤200ms）
+constexpr uint32_t STYLE_HINT_S3_MS = 250;      // S3 单圈波纹（120 灯/s × 250ms = 30 灯整一圈）
+
+// ---- M2 力度连续映射（V2 §5.3，实现但默认关）----
+// 0=离散三档（C12 饱和削顶下离散更可信，默认）；1=启用 §5.3 连续映射：
+//   N=8+round((swing-150)/1350×22) 钳位[8,30]；S3 波速 60→120 灯/s 同式；
+//   色相 青→黄→红 按 150/600/1500 三锚点分段线性；时长 220+round(t×210) ms；
+//   swing>1500 按 1500 封顶。标定数据到位后一行启用。
+#define STRIKE_CONTINUOUS 0
 
 // ---- NVS 断电记忆（V2 §5.5：开机恒进预设模式，仅恢复 effect/style 档位索引）----
 constexpr bool NVS_ENABLED = true;              // false = 纯内存行为（调参期临时关闭用）

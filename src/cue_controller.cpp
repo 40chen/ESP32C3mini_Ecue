@@ -53,8 +53,50 @@ uint32_t piezoRefractUntil = 0;               // 复用为触发后静默 + 交�
 uint32_t effectStart = 0;
 uint32_t effectUntil = 0;
 uint32_t effectColor = 0;
-uint8_t  effectIntensity = 0;                 // 力度档快照（S2 条长/S3 波速取档用）
+uint8_t  effectSpan = 8;                      // S2 条长快照（离散档表值）
+uint16_t effectSpeed = 60;                    // S3 波速快照（灯/s，离散档表值）
+uint16_t effectSwing = 0;                     // 连续模式 swing 快照（§5.3 渲染侧现算）
 uint8_t  effectStyle = 0;                     // 风格快照（0=M1 脉冲 → S1/S2/S3）
+
+// ---- §5.4 风格切换提示（微缩演示版，非阻塞，S2/S3 复用撞击绘制函数）----
+uint8_t  hintStyle = 0xFF;                    // 0xFF=无提示在播
+uint32_t hintStart = 0;
+
+// ---- §5.3 连续映射公式（STRIKE_CONTINUOUS=1 时参与编译）----
+// N=8+round((swing-150)/1350×22) 钳位[8,30]；S3 波速 60→120 同式；
+// 色相 青→黄→红 按 150/600/1500 三锚点分段线性；时长 220+round(t×210) ms。
+#if STRIKE_CONTINUOUS
+uint32_t impactColorContinuous(uint16_t sw) {
+  if (sw <= IMPACT_LEVEL1) {                      // 青→黄（150→600）
+    const float u = (float)(sw - PIEZO_TRIGGER) /
+                    (float)(IMPACT_LEVEL1 - PIEZO_TRIGGER);
+    return pixels.Color((uint8_t)lroundf(255 * u), 255,
+                        (uint8_t)lroundf(255 * (1 - u)));
+  }
+  const float u = (float)(sw - IMPACT_LEVEL1) /   // 黄→红（600→1500）
+                  (float)(IMPACT_LEVEL2 - IMPACT_LEVEL1);
+  return pixels.Color(255, (uint8_t)lroundf(255 * (1 - u)), 0);
+}
+
+uint8_t spanFromSwing(uint16_t sw) {
+  const float t = (float)(sw - PIEZO_TRIGGER) /
+                  (float)(IMPACT_LEVEL2 - PIEZO_TRIGGER);
+  return (uint8_t)constrain(8 + (int)lroundf(t * 22), 8, 30);
+}
+
+uint16_t speedFromSwing(uint16_t sw) {
+  const float t = (float)(sw - PIEZO_TRIGGER) /
+                  (float)(IMPACT_LEVEL2 - PIEZO_TRIGGER);
+  return (uint16_t)(60 + lroundf(t * 60));
+}
+
+uint32_t durationFromSwing(uint16_t sw) {
+  const float t = (float)(sw - PIEZO_TRIGGER) /
+                  (float)(IMPACT_LEVEL2 - PIEZO_TRIGGER);
+  return IMPACT_BASE_MS + (uint32_t)lroundf(t * 210);
+}
+#endif
+
 
 // ---- 确认闪 / 提示闪 FSM（非阻塞；确认闪优先，撞击渲染延迟至闪毕——规范 §3 细节 A）----
 bool     flashActive = false;
@@ -235,8 +277,20 @@ void reseedRest() {
   piezoRest = sum / 32;
 }
 
+// 64 次静息平均（比 reseedRest 更抗噪）。V2 §5.6.4：M2 上电不再触达
+// （开机恒进预设模式），代码路径保留供 M3 标定模式使用。
+[[maybe_unused]] void seedRestFull() {
+  uint32_t restSum = 0;
+  for (int i = 0; i < 64; ++i) {
+    restSum += analogRead(PIEZO_ADC_PIN);
+    delay(2);
+  }
+  piezoRest = restSum / 64;
+}
+
 void enterSensorMode() {
   fadeActive = false;
+  hintStyle = 0xFF;                               // 跨模式残留卫生
   mode = RuntimeMode::Sensor;
   pixels.setBrightness(LED_BRIGHTNESS_MAX);
   clearPixels();                                             // 交接：清灯
@@ -249,6 +303,7 @@ void enterSensorMode() {
 // 入模动作（清灯/复位/亮度恢复）与按键路径完全一致，仅反馈不同。
 void enterPresetMode(bool withFlash = true) {
   fadeActive = false;
+  hintStyle = 0xFF;                               // 跨模式残留卫生
   mode = RuntimeMode::Preset;
   pixels.setBrightness(LED_BRIGHTNESS_MAX);
   clearPixels();
@@ -261,6 +316,7 @@ void enterPresetMode(bool withFlash = true) {
 void enterStandby() {
   mode = RuntimeMode::Standby;
   flashActive = false;                                       // 中止可能在播的确认闪
+  hintStyle = 0xFF;                                          // 中止可能在播的提示
   startStandbyFade();                                        // 从当前亮度 300ms 渐灭
 }
 
@@ -281,6 +337,14 @@ void handlePiezoSensor() {
 
       const int swing = piezoMax - piezoMin;
       if (swing >= PIEZO_TRIGGER) {
+        effectStyle = styleIndex;                 // 快照：渲染中切档不跳变
+        effectStart = nowMs;                      // 照常记录（细节 A：渲染延至闪毕）
+#if STRIKE_CONTINUOUS
+        // §5.3 连续映射：触发处快照 swing 原值（封顶 1500），
+        // N/色相/波速/时长由渲染侧 §5.3 公式现算（activeColor/activeSpan/activeSpeed）
+        effectSwing = (uint16_t)min(swing, IMPACT_LEVEL2);
+        effectUntil = nowMs + durationFromSwing(effectSwing);
+#else
         const uint8_t intensity =
             (swing >= IMPACT_LEVEL2) ? 2 : (swing >= IMPACT_LEVEL1) ? 1 : 0;
         if (intensity == 0) {
@@ -290,13 +354,17 @@ void handlePiezoSensor() {
         } else {
           effectColor = pixels.Color(255, 0, 0);
         }
-        effectIntensity = intensity;              // 快照：S2 条长/S3 波速按触发档渲染
-        effectStyle = styleIndex;                 // 快照：渲染中切档不跳变
-        effectStart = nowMs;                      // 照常记录（细节 A：渲染延至闪毕）
+        effectSpan = STYLE_S2_BAR[intensity];
+        effectSpeed = STYLE_S3_SPEED_MPS[intensity];
         effectUntil = nowMs + IMPACT_BASE_MS + intensity * IMPACT_LEVEL_MS;
+#endif
+        // §5.2：S1 判定白闪段不入效果计时——白闪后效果段仍完整 220+70×level
+        if (effectStyle == 1) {
+          effectUntil += STYLE_S1_FLASH_MS;
+        }
         if (DEBUG_IMPACT) {
-          Serial.printf("[impact] swing=%d level=%u style=%u\n", swing, intensity,
-                        effectStyle);
+          Serial.printf("[impact] swing=%d style=%u span=%u speed=%u\n", swing,
+                        effectStyle, effectSpan, effectSpeed);
         }
       }
     }
@@ -332,67 +400,157 @@ void handlePiezoSensor() {
   }
 }
 
+// ---- 渲染取参（统一入口；来源随 STRIKE_CONTINUOUS 切换）----
+// 离散：触发时快照的档位参数；连续：effectSwing 快照按 §5.3 公式现算。
+uint32_t activeColor() {
+#if STRIKE_CONTINUOUS
+  return impactColorContinuous(effectSwing);
+#else
+  return effectColor;
+#endif
+}
+
+uint8_t activeSpan() {
+#if STRIKE_CONTINUOUS
+  return spanFromSwing(effectSwing);
+#else
+  return effectSpan;
+#endif
+}
+
+uint16_t activeSpeed() {
+#if STRIKE_CONTINUOUS
+  return speedFromSwing(effectSwing);
+#else
+  return effectSpeed;
+#endif
+}
+
+// ---- S2/S3 绘制（撞击渲染与 §5.4 提示共用；参数已快照，全量重画无需清屏）----
+void drawS2Bar(uint32_t color, uint8_t pulse, uint8_t span) {
+  const int center = LED_COUNT / 2;
+  const int from = center - span / 2;             // 8 灯=11..18（同 M1 击打口径）
+  const int to = from + span - 1;                 // 16=7..22 / 30=0..29
+  for (uint8_t index = 0; index < LED_COUNT; ++index) {
+    if (index >= from && index <= to) {
+      pixels.setPixelColor(index, dimColor(color, pulse));
+    } else {
+      pixels.setPixelColor(index, 0);
+    }
+  }
+}
+
+void drawS3Wave(uint32_t color, uint8_t pulse, uint32_t elapsed, uint16_t speed) {
+  const int center = LED_COUNT / 2;
+  // 波前距中心灯数 = elapsed × 波速；波前 2 灯全亮（§5.2），过处每灯 -40 渐灭尾迹
+  const uint32_t waveFront = (uint32_t)((uint64_t)elapsed * speed / 1000);
+  for (uint8_t index = 0; index < LED_COUNT; ++index) {
+    const int distance = abs(index - center);
+    if (distance <= (int)waveFront) {
+      const uint32_t ledOffset = waveFront - (uint32_t)distance;
+      const uint8_t falloff =
+          (uint8_t)min((ledOffset < 2 ? 0ul : (ledOffset - 1) * 40), 255ul);
+      const uint8_t brightness = (uint8_t)((pulse * (255 - falloff)) / 255);
+      pixels.setPixelColor(index, dimColor(color, brightness));
+    } else {
+      pixels.setPixelColor(index, 0);
+    }
+  }
+}
+
 // ---- 撞击响应渲染（M2 多风格分派；公共=三档色 + 220+70×level ms）----
-// 各风格共享 pulse 公共衰减曲线；渲染参数（颜色/力度/风格）在触发时已快照。
-void runPiezoEffect() {
+// 返回 true=撞击效果仍在活跃（§5.4 提示在其空闲时才渲染）。
+bool runPiezoEffect() {
   uint32_t now = millis();
   if (now >= effectUntil) {
     clearPixels();
-    return;
+    return false;
   }
 
-  // 从真实触发时刻(effectStart)起算衰减
   const uint32_t duration = effectUntil - effectStart;
-  const uint32_t elapsed = now - effectStart;
-  const uint8_t pulse =
-      255 - (uint8_t)min((elapsed * 255) / duration, 255ul);
-  const int center = LED_COUNT / 2;
+  uint32_t elapsed = now - effectStart;
 
-  // ---- S1 判定风格：全条白闪 60ms → 中心 12 灯力度色脉冲 ----
-  if (effectStyle == 1 && elapsed < STYLE_S1_FLASH_MS) {
-    pixels.fill(pixels.Color(255, 255, 255));
-    pixels.show();
-    return;
+  // ---- S1 判定风格：全条白闪 60ms（不入效果计时）→ 中心 12 灯力度色脉冲 ----
+  if (effectStyle == 1) {
+    if (elapsed < STYLE_S1_FLASH_MS) {
+      pixels.fill(pixels.Color(255, 255, 255));
+      pixels.show();
+      return true;
+    }
+    elapsed -= STYLE_S1_FLASH_MS;                 // 脉冲段从 255 起跳、全时长衰减
   }
+  const uint32_t dur = (effectStyle == 1) ? duration - STYLE_S1_FLASH_MS : duration;
+  const uint8_t pulse = 255 - (uint8_t)min((elapsed * 255) / dur, 255ul);
 
-  pixels.clear();
-  for (uint8_t index = 0; index < LED_COUNT; ++index) {
-    const int distance = abs(index - center);
-    switch (effectStyle) {
-      case 1: {   // S1 白闪后：中心 12 灯力度色脉冲（|index-center|<6，同 M1 现状）
+  switch (effectStyle) {
+    case 1: {   // S1 白闪后：中心 12 灯力度色脉冲（|index-center|<6，同 M1 现状）
+      const int center = LED_COUNT / 2;
+      pixels.clear();
+      for (uint8_t index = 0; index < LED_COUNT; ++index) {
+        const int distance = abs(index - center);
         if (distance < STYLE_S1_PULSE_SPAN) {
           const uint8_t brightness = constrain(pulse - distance * 30, 0, 255);
           pixels.setPixelColor(index, dimColor(effectColor, brightness));
         }
-        break;
       }
-      case 2: {   // S2 力度→长度条：N=8/16/30，从 from 起向右铺（8 灯=11..18，同 M1 击打口径）
-        const int span = STYLE_S2_BAR[effectIntensity];       // 8/16/30
-        const int from = center - span / 2;                   // 11/7/0
-        const int to = from + span - 1;                       // 18/22/29
-        if (index >= from && index <= to) {
-          pixels.setPixelColor(index, dimColor(effectColor, pulse));
-        }
-        break;
-      }
-      case 3: {   // S3 波纹扩散：波前距中心 = elapsed × 波速，波前亮+渐尾
-        const uint32_t waveFront = (uint32_t)((uint64_t)elapsed *
-                                              STYLE_S3_SPEED_MPS[effectIntensity] / 1000);
-        if (distance <= (int)waveFront) {
-          const uint8_t falloff = (uint8_t)min((waveFront - (uint32_t)distance) * 40, 255ul);
-          const uint8_t brightness = (uint8_t)((pulse * (255 - falloff)) / 255);
-          pixels.setPixelColor(index, dimColor(effectColor, brightness));
-        }
-        break;
-      }
-      default: {  // 风格 0 = M1 现状：中心 12 灯脉冲（逐灯渐变）
+      pixels.show();
+      break;
+    }
+    case 2: {   // S2 力度→长度条（取参：离散档快照 / 连续 §5.3 现算）
+      drawS2Bar(activeColor(), pulse, activeSpan());
+      pixels.show();
+      break;
+    }
+    case 3: {   // S3 波纹扩散（取参同上）
+      drawS3Wave(activeColor(), pulse, elapsed, activeSpeed());
+      pixels.show();
+      break;
+    }
+    default: {  // 风格 0 = M1 现状：中心 12 灯脉冲（逐灯渐变）
+      const int center = LED_COUNT / 2;
+      pixels.clear();
+      for (uint8_t index = 0; index < LED_COUNT; ++index) {
+        const int distance = abs(index - center);
         if (distance < 6) {
           const uint8_t brightness = constrain(pulse - distance * 30, 0, 255);
           pixels.setPixelColor(index, dimColor(effectColor, brightness));
         }
-        break;
       }
+      pixels.show();
+      break;
     }
+  }
+  return true;
+}
+
+// ---- §5.4 风格切换提示（微缩演示版）：S2=中心迷你条快衰减 ≤200ms；
+// S3=单圈快速波纹 ≤250ms（120 灯/s × 250ms = 30 灯整一圈）。
+// 复用撞击绘制函数合成触发，不占 effectUntil（与撞击状态机完全隔离）。
+// 仲裁位置：flash/fade 之下、撞击空闲时才播；再次短按即打断进下一态。
+void startStyleHint(uint8_t style) {
+  hintStyle = style;
+  hintStart = millis();
+}
+
+void hintRenderFrame() {
+  if (hintStyle == 0xFF) {
+    return;
+  }
+  const uint32_t total =
+      (hintStyle == 3) ? STYLE_HINT_S3_MS : STYLE_HINT_S2_MS;
+  const uint32_t elapsed = millis() - hintStart;
+  if (elapsed >= total) {
+    hintStyle = 0xFF;
+    clearPixels();
+    return;
+  }
+  const uint8_t pulse = 255 - (uint8_t)((elapsed * 255) / total);
+  if (hintStyle == 2) {
+    // 合成参数：L0 档形态——中心 8 灯 + 青（展示 S2"条"的特征）
+    drawS2Bar(pixels.Color(0, 255, 255), pulse, 8);
+  } else {
+    // 合成参数：L2 档形态——120 灯/s 单圈 + 红（展示 S3"波"的特征）
+    drawS3Wave(pixels.Color(255, 0, 0), pulse, elapsed, 120);
   }
   pixels.show();
 }
@@ -555,8 +713,15 @@ void handleButtons() {
       saveImpactState();                            // V2 §5.5 写点：档位变更即落 NVS
     } else if (mode == RuntimeMode::Sensor) {
       styleIndex = (styleIndex + 1) % STYLE_COUNT;  // 四态循环：M1 脉冲→S1→S2→S3
-      startFlash(pixels.Color(255, 255, 255),
-                 STYLE_HINT_FLASHES);               // §5.4 演示版：单闪白提示
+      // §5.4 四态互异提示：0=绿闪 60ms / S1=白闪 60ms（复用确认闪 FSM，单闪）；
+      // S2/S3=微缩演示（复用渲染分支合成触发，见 hintRenderFrame）
+      if (styleIndex == 0) {
+        startFlash(pixels.Color(0, 150, 70), 1);    // 台呢绿
+      } else if (styleIndex == 1) {
+        startFlash(pixels.Color(255, 255, 255), 1); // 白
+      } else {
+        startStyleHint(styleIndex);
+      }
       saveImpactState();                            // V2 §5.5 写点：档位变更即落 NVS
     }
   }
@@ -629,7 +794,10 @@ void cueControllerLoop() {
     return;
   }
   if (mode == RuntimeMode::Sensor) {
-    runPiezoEffect();
+    const bool impactActive = runPiezoEffect();
+    if (!impactActive) {
+      hintRenderFrame();                            // §5.4 提示：撞击空闲时播，撞击活跃即让位
+    }
   } else if (mode == RuntimeMode::Preset) {
     runPresetEffect();
   }
