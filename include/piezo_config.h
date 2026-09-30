@@ -42,3 +42,21 @@ constexpr uint32_t FLASH_ON_MS = 60;            // 确认闪：亮 60ms
 constexpr uint32_t FLASH_OFF_MS = 60;           // 确认闪：灭 60ms，2 下共 240ms
 constexpr uint32_t STANDBY_FADE_MS = 300;       // 进入待机：300ms 线性渐灭
 constexpr uint32_t HANDOVER_SILENCE_MS = 200;   // 进传感器模式交接静默（与确认闪并行）
+
+// ---- M2 撞击三风格（交互规范 V2 §5；风格 0 = M1 现状中心脉冲）----
+// 四态循环（冻结口径 §五#1）：0=M1 脉冲默认 → S1 判定 → S2 长度条 → S3 波纹。
+constexpr uint8_t STYLE_COUNT = 4;
+constexpr uint32_t STYLE_S1_FLASH_MS = 60;      // S1 判定：全条白闪 60ms → 中心 12 灯力度色脉冲
+constexpr uint8_t  STYLE_S1_PULSE_SPAN = 6;     // S1 中心 12 灯（|index-center|<6，同 M1 现状）
+constexpr uint8_t  STYLE_S2_BAR[3] = {8, 16, 30};     // S2 力度→长度条（三档灯数）
+constexpr uint16_t STYLE_S3_SPEED_MPS[3] = {60, 90, 120};  // S3 波纹扩散波速（灯/秒，三档）
+constexpr uint32_t IMPACT_BASE_MS = 220;        // 撞击响应时长 = 220 + 70 × level（M1 现状，公共）
+constexpr uint32_t IMPACT_LEVEL_MS = 70;
+
+// ---- M2 风格切换提示（V2 §5.4，默认演示版、可砍不阻塞）----
+constexpr uint32_t STYLE_HINT_FLASHES = 1;      // 演示版：切换时单闪提示
+
+// ---- NVS 断电记忆（V2 §5.5：开机恒进预设模式，仅恢复 effect/style 档位索引）----
+constexpr bool NVS_ENABLED = true;              // false = 纯内存行为（调参期临时关闭用）
+constexpr char NVS_NS[] = "ecue";               // 命名空间
+constexpr char NVS_KEY[] = "state";             // 单 key 三字段打包（effect/style/mode）
