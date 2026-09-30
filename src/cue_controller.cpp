@@ -49,17 +49,19 @@ int      piezoMin = 0;
 int      piezoMax = 0;
 uint32_t piezoRefractUntil = 0;               // 复用为触发后静默 + 交接静默
 
-// ---- 撞击响应（M1 维持现状：中心脉冲三档色）----
+// ---- 撞击响应（M2 多风格：渲染参数在触发时快照，渲染中切档不跳变）----
 uint32_t effectStart = 0;
 uint32_t effectUntil = 0;
 uint32_t effectColor = 0;
+uint8_t  effectIntensity = 0;                 // 力度档快照（S2 条长/S3 波速取档用）
+uint8_t  effectStyle = 0;                     // 风格快照（0=M1 脉冲 → S1/S2/S3）
 
-// ---- 确认闪 FSM（非阻塞；确认闪优先，撞击渲染延迟至闪毕——规范 §3 细节 A）----
+// ---- 确认闪 / 提示闪 FSM（非阻塞；确认闪优先，撞击渲染延迟至闪毕——规范 §3 细节 A）----
 bool     flashActive = false;
 uint32_t flashStart = 0;
 uint32_t flashColor = 0;
+uint8_t  flashTimes = 2;                      // 闪几下（模式确认 2 下，风格提示 1 下）
 constexpr uint32_t FLASH_PERIOD_MS = FLASH_ON_MS + FLASH_OFF_MS;
-constexpr uint32_t FLASH_TOTAL_MS = FLASH_PERIOD_MS * 2;   // 2 下短闪 = 240ms
 
 // ---- 待机渐灭 FSM（不清缓冲区，靠降全局亮度实现"从当前亮度线性降 0"）----
 bool     fadeActive = false;
@@ -178,17 +180,19 @@ void loadImpactState() {
   styleIndex = (s.style < STYLE_COUNT) ? s.style : 0;
 }
 
-// ---- 确认闪 ----
-void startConfirmFlash(uint32_t color) {
+// ---- 确认闪 / 提示闪 ----
+void startFlash(uint32_t color, uint8_t times) {
   flashColor = color;
   flashStart = millis();
+  flashTimes = times;
   flashActive = true;
 }
 
 // 返回 true=仍在闪。调用方保证窗口期不进来（细节 B：闪遇窗口暂停刷帧）。
 bool flashRenderFrame() {
   const uint32_t elapsed = millis() - flashStart;
-  if (elapsed >= FLASH_TOTAL_MS) {
+  const uint32_t total = FLASH_PERIOD_MS * flashTimes;
+  if (elapsed >= total) {
     flashActive = false;
     pixels.setBrightness(LED_BRIGHTNESS_MAX);   // 渐灭可能动过全局亮度，恢复
     return false;
@@ -238,7 +242,7 @@ void enterSensorMode() {
   clearPixels();                                             // 交接：清灯
   reseedRest();                                              // 32 次静息均值重播种
   piezoRefractUntil = millis() + HANDOVER_SILENCE_MS;        // 交接静默，防头一秒误触发
-  startConfirmFlash(pixels.Color(0, 200, 80));               // 绿闪（与静默并行）
+  startFlash(pixels.Color(0, 200, 80), 2);                   // 绿闪 2 下（与静默并行）
 }
 
 // withFlash=false 用于开机初始化（V2 §5.6：开机无确认闪，灯效即反馈）；
@@ -250,7 +254,7 @@ void enterPresetMode(bool withFlash = true) {
   clearPixels();
   resetPresetState();
   if (withFlash) {
-    startConfirmFlash(pixels.Color(40, 120, 255));           // 蓝闪
+    startFlash(pixels.Color(40, 120, 255), 2);               // 蓝闪 2 下
   }
 }
 
@@ -286,10 +290,13 @@ void handlePiezoSensor() {
         } else {
           effectColor = pixels.Color(255, 0, 0);
         }
+        effectIntensity = intensity;              // 快照：S2 条长/S3 波速按触发档渲染
+        effectStyle = styleIndex;                 // 快照：渲染中切档不跳变
         effectStart = nowMs;                      // 照常记录（细节 A：渲染延至闪毕）
-        effectUntil = nowMs + 220 + intensity * 70;
+        effectUntil = nowMs + IMPACT_BASE_MS + intensity * IMPACT_LEVEL_MS;
         if (DEBUG_IMPACT) {
-          Serial.printf("[impact] swing=%d level=%u\n", swing, intensity);
+          Serial.printf("[impact] swing=%d level=%u style=%u\n", swing, intensity,
+                        effectStyle);
         }
       }
     }
@@ -325,7 +332,8 @@ void handlePiezoSensor() {
   }
 }
 
-// ---- 撞击响应渲染（M1 现状：中心脉冲，三档力度色）----
+// ---- 撞击响应渲染（M2 多风格分派；公共=三档色 + 220+70×level ms）----
+// 各风格共享 pulse 公共衰减曲线；渲染参数（颜色/力度/风格）在触发时已快照。
 void runPiezoEffect() {
   uint32_t now = millis();
   if (now >= effectUntil) {
@@ -338,14 +346,50 @@ void runPiezoEffect() {
   const uint32_t elapsed = now - effectStart;
   const uint8_t pulse =
       255 - (uint8_t)min((elapsed * 255) / duration, 255ul);
+  const int center = LED_COUNT / 2;
+
+  // ---- S1 判定风格：全条白闪 60ms → 中心 12 灯力度色脉冲 ----
+  if (effectStyle == 1 && elapsed < STYLE_S1_FLASH_MS) {
+    pixels.fill(pixels.Color(255, 255, 255));
+    pixels.show();
+    return;
+  }
 
   pixels.clear();
-  int center = LED_COUNT / 2;
   for (uint8_t index = 0; index < LED_COUNT; ++index) {
-    int distance = abs(index - center);
-    if (distance < 6) {
-      uint8_t brightness = constrain(pulse - distance * 30, 0, 255);
-      pixels.setPixelColor(index, dimColor(effectColor, brightness));
+    const int distance = abs(index - center);
+    switch (effectStyle) {
+      case 1: {   // S1 白闪后：中心 12 灯力度色脉冲（|index-center|<6，同 M1 现状）
+        if (distance < STYLE_S1_PULSE_SPAN) {
+          const uint8_t brightness = constrain(pulse - distance * 30, 0, 255);
+          pixels.setPixelColor(index, dimColor(effectColor, brightness));
+        }
+        break;
+      }
+      case 2: {   // S2 力度→长度条：中心对称 N=8/16/30，条内均匀公共衰减
+        const int half = STYLE_S2_BAR[effectIntensity] / 2;   // 4/8/15
+        if (distance <= half) {
+          pixels.setPixelColor(index, dimColor(effectColor, pulse));
+        }
+        break;
+      }
+      case 3: {   // S3 波纹扩散：波前距中心 = elapsed × 波速，波前亮+渐尾
+        const uint32_t waveFront = (uint32_t)((uint64_t)elapsed *
+                                              STYLE_S3_SPEED_MPS[effectIntensity] / 1000);
+        if (distance <= (int)waveFront) {
+          const uint8_t falloff = (uint8_t)min((waveFront - (uint32_t)distance) * 40, 255ul);
+          const uint8_t brightness = (uint8_t)((pulse * (255 - falloff)) / 255);
+          pixels.setPixelColor(index, dimColor(effectColor, brightness));
+        }
+        break;
+      }
+      default: {  // 风格 0 = M1 现状：中心 12 灯脉冲（逐灯渐变）
+        if (distance < 6) {
+          const uint8_t brightness = constrain(pulse - distance * 30, 0, 255);
+          pixels.setPixelColor(index, dimColor(effectColor, brightness));
+        }
+        break;
+      }
     }
   }
   pixels.show();
@@ -507,10 +551,14 @@ void handleButtons() {
       resetPresetState();
       lastPresetUpdate = 0;                         // 新效果立即渲染
       saveImpactState();                            // V2 §5.5 写点：档位变更即落 NVS
+    } else if (mode == RuntimeMode::Sensor) {
+      styleIndex = (styleIndex + 1) % STYLE_COUNT;  // 四态循环：M1 脉冲→S1→S2→S3
+      startFlash(pixels.Color(255, 255, 255),
+                 STYLE_HINT_FLASHES);               // §5.4 演示版：单闪白提示
+      saveImpactState();                            // V2 §5.5 写点：档位变更即落 NVS
     }
-    // 传感器模式：风格切换随 M2 三风格落地（见 handleButtons M2 版本）
   }
-  // btn1 长按：键位语义预留（M3 现场重标定入口），M1 不实现
+  // btn1 长按：键位语义预留（M3 现场重标定入口），暂不实现
 }
 
 }  // namespace
