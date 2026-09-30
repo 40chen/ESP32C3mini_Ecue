@@ -1,11 +1,16 @@
 #include <Arduino.h>
 #include "piezo_test.h"
+#include "piezo_config.h"
 
 // =====================================================================
 // 压电撞击观察程序（改进版，直接替换原 piezo_test.cpp）
 //
 // 板子: ESP32-C3 mini
 // 信号链: 压电传感器 -> AD8605 电荷放大器(R16=10M, C12=10p) -> GPIO4
+//
+// 注：与运行时固件共用的口径（触发阈值/30ms 窗口/静默期/死区/静息 EMA）
+// 统一出自 include/piezo_config.h（双 app 单一来源，改 config 两边生效）；
+// 本标定程序独有参数在下方本地定义。
 //
 // 针对的问题（见对话总结）:
 //  1) AD8605 输出长期贴在 0V 或满量程轨上，数据大部分不是敲击产生的
@@ -28,17 +33,20 @@
 
 namespace {
 
-constexpr uint8_t PIEZO_PIN = 4;   // ADC1_CH4，与 WiFi 不冲突（ADC2 才会冲突）
+constexpr uint8_t PIEZO_PIN = PIEZO_ADC_PIN;   // ADC1_CH4，与 WiFi 不冲突（ADC2 才会冲突）
 
 // ---------------- 可调参数 ----------------
+// 共用口径出自 include/piezo_config.h（触发阈值/窗口/静默期/死区/静息 EMA/ADC 引脚）
+constexpr int      TRIGGER_THRESHOLD = PIEZO_TRIGGER;
+constexpr int      DEAD_ZONE         = PIEZO_DEAD_ZONE;
+constexpr uint32_t WINDOW_US         = PIEZO_WINDOW_US;
+constexpr uint32_t REFRACTORY_MS     = PIEZO_REFRACT_MS;
+constexpr uint32_t REST_UPDATE_US    = PIEZO_REST_UPDATE_US;
+constexpr int      BASELINE_SHIFT    = PIEZO_REST_SHIFT;
+
+// 本标定程序独有：
 constexpr uint32_t IDLE_INTERVAL_US  = 400;    // 平时轮询间隔，约 2.5kHz
-constexpr uint32_t REST_UPDATE_US    = 2000;   // 静息电平更新周期（EMA 时间常数约 128ms）
-constexpr int      TRIGGER_THRESHOLD = 150;    // 触发阈值(码)。误触发多 -> 调大；轻敲不触发 -> 调小
-constexpr int      DEAD_ZONE         = 40;     // 静噪死区(码)。滤掉 ±31 码的贴轨噪声，仍有零星行 -> 调到 50~60
-constexpr uint32_t WINDOW_US         = 30000;  // 触发后高速采样窗口 30ms
-constexpr uint32_t REFRACTORY_MS     = 200;    // 窗口结束后的静默期
 constexpr uint32_t STUCK_STATUS_MS   = 5000;   // 无事件时贴轨状态行的打印周期
-constexpr int      BASELINE_SHIFT    = 6;      // rest 的 EMA 步长 = 1/64
 
 constexpr int ADC_MAX   = 4095;                // 12bit
 constexpr int RAIL_HIGH = ADC_MAX - 10;        // >=4085 视为贴上轨（ADC 满量程，约 2.5V）

@@ -2,37 +2,43 @@
 #include <Adafruit_NeoPixel.h>
 
 #include "cue_controller.h"
+#include "piezo_config.h"
+
+// =====================================================================
+// ECUE 运行时双模式固件（M1）
+//
+// 模式：传感器（压电引擎+撞击响应）/ 预设灯效（五效果循环）/ 待机（全灭）
+// 按键：btn2(IO10) 短按互切模式、长按 2s 待机；
+//       btn1(IO0)  预设模式内循环效果（传感器模式 M1 无动作，风格切换留 M2；
+//                  长按语义已预留，现场重标定随 M3 落地）。
+// 待机中任意短按唤醒回传感器模式。
+// 交互口径见《ECUE_交互规范_设计匠人_20260930》V1；参数见 piezo_config.h。
+// =====================================================================
 
 namespace {
-constexpr uint8_t AO_PIN = 4;
-constexpr uint8_t LED_PIN = 7;
-constexpr uint8_t LED_COUNT = 30;
-constexpr uint8_t BUTTON_PIEZO = 6;
-constexpr uint8_t BUTTON_PRESET = 5;
 
 Adafruit_NeoPixel pixels(LED_COUNT, LED_PIN, NEO_GRB + NEO_KHZ800);
 
-enum class LedMode : uint8_t {
-  Off,
-  Piezo,
-  Preset
+// ---- 运行时模式 ----
+enum class RuntimeMode : uint8_t {
+  Sensor,   // 传感器模式：压电引擎 + 撞击响应
+  Preset,   // 预设灯效模式：五效果循环
+  Standby   // 待机：全灭
 };
 
-LedMode currentMode = LedMode::Off;
-uint8_t presetIndex = 0;
-uint32_t lastPresetUpdate = 0;
+#if defined(APP_MODE_BOOT_PRESET)
+RuntimeMode mode = RuntimeMode::Preset;       // 可选：开机进预设灯效模式
+#else
+RuntimeMode mode = RuntimeMode::Sensor;       // 开机默认=传感器模式
+#endif
 
-// ---- 压电撞击检测（改进版：双向触发 + 饱和免疫，调参说明见 README）----
-constexpr uint32_t PIEZO_POLL_US = 500;      // 平时轮询间隔，约2kHz
-constexpr uint32_t PIEZO_REST_US = 2000;     // 静息电平更新节奏，时间常数约128ms
-constexpr int      PIEZO_REST_SHIFT = 6;     // 静息EMA步长1/64
-constexpr int      PIEZO_TRIGGER = 150;      // 触发阈值（码），约92mV@2.5V满量程
-constexpr uint32_t PIEZO_WINDOW_US = 20000;  // 触发后高速采样窗口
-constexpr uint32_t PIEZO_REFRACT_MS = 200;   // 触发后静默期，防余振连发
-constexpr int      IMPACT_LEVEL1 = 600;      // swing >= 此值 -> 黄
-constexpr int      IMPACT_LEVEL2 = 1500;     // swing >= 此值 -> 红
-constexpr bool     DEBUG_IMPACT = true;      // 触发时打印swing，标定完阈值可改false
+constexpr bool DEBUG_IMPACT = true;           // 触发时打印 swing，标定完可改 false
 
+uint8_t presetIndex = 0;                      // 预设域档位记忆（来回切模式不重置）
+constexpr uint8_t PRESET_COUNT = 5;           // 五效果，无黑档；Off 语义移交 btn2 长按
+uint32_t lastPresetUpdate = 0;                // 预设效果 25ms 渲染节流
+
+// ---- 压电引擎状态 ----
 uint32_t piezoLastPollUs = 0;
 uint32_t piezoLastRestUs = 0;
 int      piezoRest = 0;
@@ -40,16 +46,49 @@ bool     piezoInWindow = false;
 uint32_t piezoWindowStartUs = 0;
 int      piezoMin = 0;
 int      piezoMax = 0;
-uint32_t piezoRefractUntil = 0;
+uint32_t piezoRefractUntil = 0;               // 复用为触发后静默 + 交接静默
 
+// ---- 撞击响应（M1 维持现状：中心脉冲三档色）----
 uint32_t effectStart = 0;
 uint32_t effectUntil = 0;
 uint32_t effectColor = 0;
 
-bool piezoButtonPressed = false;
-bool presetButtonPressed = false;
-uint32_t piezoButtonDebounce = 0;
-uint32_t presetButtonDebounce = 0;
+// ---- 确认闪 FSM（非阻塞；确认闪优先，撞击渲染延迟至闪毕——规范 §3 细节 A）----
+bool     flashActive = false;
+uint32_t flashStart = 0;
+uint32_t flashColor = 0;
+constexpr uint32_t FLASH_PERIOD_MS = FLASH_ON_MS + FLASH_OFF_MS;
+constexpr uint32_t FLASH_TOTAL_MS = FLASH_PERIOD_MS * 2;   // 2 下短闪 = 240ms
+
+// ---- 待机渐灭 FSM（不清缓冲区，靠降全局亮度实现"从当前亮度线性降 0"）----
+bool     fadeActive = false;
+uint32_t fadeStart = 0;
+uint8_t  fadeFrom = LED_BRIGHTNESS_MAX;
+
+// ---- 按键驱动（消抖 40ms + 短按释放判定 + 2s 长按）----
+enum class PressEvent : uint8_t { None, Short, Long };
+
+struct Button {
+  uint8_t pin;
+  bool rawPressed;
+  uint32_t lastEdgeMs;
+  uint32_t pressStartMs;
+  bool longFired;
+  explicit Button(uint8_t p)
+      : pin(p), rawPressed(false), lastEdgeMs(0), pressStartMs(0), longFired(false) {}
+};
+
+Button btnEffect{BTN_EFFECT};   // btn1
+Button btnMode{BTN_MODE};       // btn2
+
+// ---- 预设效果内部状态（切档/切模式时经 resetPresetState() 复位）----
+uint8_t  rainbowOffset = 0;                 // 效果0 彩虹流
+int8_t   scanPos = 0;                       // 效果3 追光扫描
+int8_t   scanDir = 1;
+uint8_t  scanHalf = 0;                      // 2 帧/灯步 => 60 帧/向（规范 §4）
+bool     striking = false;                  // 效果4 击打闪光
+uint32_t strikeStart = 0;
+uint32_t strikeNextAt = 0;
 
 uint32_t wheel(uint8_t position) {
   position = 255 - position;
@@ -78,129 +117,116 @@ void clearPixels() {
   pixels.show();
 }
 
-bool readButtonPress(uint8_t pin, uint32_t &debounceTime, bool &pressed) {
-  bool currentPressed = digitalRead(pin) == LOW;
-  if (millis() - debounceTime < 40) {
+// ---- 台球标准色板（交互规范 §4 效果1；1..8 号球本色）----
+uint32_t ballColor(uint8_t ball) {
+  switch (ball) {
+    case 1: return pixels.Color(255, 210, 0);    // 黄
+    case 2: return pixels.Color(0, 80, 255);     // 蓝
+    case 3: return pixels.Color(255, 0, 0);      // 红
+    case 4: return pixels.Color(140, 0, 255);    // 紫
+    case 5: return pixels.Color(255, 100, 0);    // 橙
+    case 6: return pixels.Color(0, 170, 60);     // 绿
+    case 7: return pixels.Color(125, 50, 10);    // 栗
+    default: return pixels.Color(40, 40, 40);    // 8 号=炭灰微光（规范指定）
+  }
+}
+
+void resetPresetState() {
+  rainbowOffset = 0;
+  scanPos = 0;
+  scanDir = 1;
+  scanHalf = 0;
+  striking = false;
+  strikeStart = 0;
+  strikeNextAt = 0;
+}
+
+// ---- 确认闪 ----
+void startConfirmFlash(uint32_t color) {
+  flashColor = color;
+  flashStart = millis();
+  flashActive = true;
+}
+
+// 返回 true=仍在闪。调用方保证窗口期不进来（细节 B：闪遇窗口暂停刷帧）。
+bool flashRenderFrame() {
+  const uint32_t elapsed = millis() - flashStart;
+  if (elapsed >= FLASH_TOTAL_MS) {
+    flashActive = false;
+    pixels.setBrightness(LED_BRIGHTNESS_MAX);   // 渐灭可能动过全局亮度，恢复
     return false;
   }
-
-  if (currentPressed && !pressed) {
-    pressed = true;
-    debounceTime = millis();
-    return true;
-  }
-
-  if (!currentPressed && pressed) {
-    pressed = false;
-    debounceTime = millis();
-  }
-  return false;
-}
-
-void runPresetEffect() {
-  uint32_t now = millis();
-  if (now - lastPresetUpdate < 25) {
-    return;
-  }
-  lastPresetUpdate = now;
-
-  switch (presetIndex) {
-    case 0: {
-      static uint8_t rainbowOffset = 0;
-      for (uint8_t index = 0; index < LED_COUNT; ++index) {
-        pixels.setPixelColor(index, wheel((index * 256 / LED_COUNT + rainbowOffset) & 0xFF));
-      }
-      rainbowOffset += 4;
-      pixels.show();
-      break;
-    }
-    case 1: {
-      static uint8_t wavePosition = 0;
-      pixels.clear();
-      for (uint8_t index = 0; index < LED_COUNT; ++index) {
-        int distance = abs(index - wavePosition);
-        if (distance < 6) {
-          pixels.setPixelColor(index, dimColor(pixels.Color(0, 180, 255), 255 - distance * 40));
-        }
-      }
-      wavePosition = (wavePosition + 1) % LED_COUNT;
-      pixels.show();
-      break;
-    }
-    case 2: {
-      static uint8_t sweepPosition = 0;
-      pixels.clear();
-      for (uint8_t index = 0; index < LED_COUNT; ++index) {
-        int distance = abs(index - sweepPosition);
-        if (distance < 5) {
-          pixels.setPixelColor(index, dimColor(pixels.Color(255, 120, 0), 255 - distance * 55));
-        }
-      }
-      sweepPosition = (sweepPosition + 1) % LED_COUNT;
-      pixels.show();
-      break;
-    }
-    case 3: {
-      uint8_t breathe = (now / 20) % 255;
-      if (breathe > 127) {
-        breathe = 255 - breathe;
-      }
-      pixels.fill(dimColor(pixels.Color(0, 180, 255), 70 + breathe));
-      pixels.show();
-      break;
-    }
-    case 4: {
-      static uint8_t ringPosition = 0;
-      pixels.clear();
-      for (uint8_t index = 0; index < LED_COUNT; ++index) {
-        int distance = min(abs(index - ringPosition),
-                          abs(index - (ringPosition + LED_COUNT / 2) % LED_COUNT));
-        if (distance < 3) {
-          pixels.setPixelColor(index, dimColor(pixels.Color(255, 0, 203), 255 - distance * 70));
-        }
-      }
-      ringPosition = (ringPosition + 1) % LED_COUNT;
-      pixels.show();
-      break;
-    }
-    default:
-      clearPixels();
-      break;
-  }
-}
-
-void runPiezoEffect() {
-  uint32_t now = millis();
-  if (now >= effectUntil) {
-    clearPixels();
-    return;
-  }
-
-  // 修复：从真实触发时刻(effectStart)起算衰减，原式反推起点导致 pulse 恒为 0
-  const uint32_t duration = effectUntil - effectStart;
-  const uint32_t elapsed = now - effectStart;
-  const uint8_t pulse =
-      255 - (uint8_t)min((elapsed * 255) / duration, 255ul);
-
-  pixels.clear();
-  int center = LED_COUNT / 2;
-  for (uint8_t index = 0; index < LED_COUNT; ++index) {
-    int distance = abs(index - center);
-    if (distance < 6) {
-      uint8_t brightness = constrain(pulse - distance * 30, 0, 255);
-      pixels.setPixelColor(index, dimColor(effectColor, brightness));
-    }
+  if (elapsed % FLASH_PERIOD_MS < FLASH_ON_MS) {
+    pixels.fill(flashColor);                    // 亮度受全局帽约束
+  } else {
+    pixels.clear();
   }
   pixels.show();
+  return true;
 }
 
+// ---- 待机渐灭 ----
+void startStandbyFade() {
+  fadeStart = millis();
+  fadeFrom = LED_BRIGHTNESS_MAX;
+  fadeActive = true;
+}
+
+void fadeRenderFrame() {
+  const uint32_t elapsed = millis() - fadeStart;
+  if (elapsed >= STANDBY_FADE_MS) {
+    fadeActive = false;
+    pixels.setBrightness(0);
+    pixels.show();
+    return;
+  }
+  pixels.setBrightness(fadeFrom - (uint8_t)((fadeFrom * elapsed) / STANDBY_FADE_MS));
+  pixels.show();                                // 缓冲区保留原画面，随全局亮度线性降 0
+}
+
+// ---- 模式交接（规范 §3：清灯 → 确认闪 ∥ 静默 200ms + 静息重播种）----
+void reseedRest() {
+  uint32_t sum = 0;
+  for (int i = 0; i < 32; ++i) {
+    sum += analogRead(PIEZO_ADC_PIN);
+    delayMicroseconds(100);
+  }
+  piezoRest = sum / 32;
+}
+
+void enterSensorMode() {
+  fadeActive = false;
+  mode = RuntimeMode::Sensor;
+  pixels.setBrightness(LED_BRIGHTNESS_MAX);
+  clearPixels();                                             // 交接：清灯
+  reseedRest();                                              // 32 次静息均值重播种
+  piezoRefractUntil = millis() + HANDOVER_SILENCE_MS;        // 交接静默，防头一秒误触发
+  startConfirmFlash(pixels.Color(0, 200, 80));               // 绿闪（与静默并行）
+}
+
+void enterPresetMode() {
+  fadeActive = false;
+  mode = RuntimeMode::Preset;
+  pixels.setBrightness(LED_BRIGHTNESS_MAX);
+  clearPixels();
+  resetPresetState();
+  startConfirmFlash(pixels.Color(40, 120, 255));             // 蓝闪
+}
+
+void enterStandby() {
+  mode = RuntimeMode::Standby;
+  flashActive = false;                                       // 中止可能在播的确认闪
+  startStandbyFade();                                        // 从当前亮度 300ms 渐灭
+}
+
+// ---- 压电引擎（仅传感器模式被调度；窗口期全速采样）----
 void handlePiezoSensor() {
   const uint32_t nowUs = micros();
   const uint32_t nowMs = millis();
 
   // ---- 窗口期：全速采样，记录最小/最大 ----
   if (piezoInWindow) {
-    const int raw = analogRead(AO_PIN);
+    const int raw = analogRead(PIEZO_ADC_PIN);
     if (raw < piezoMin) piezoMin = raw;
     if (raw > piezoMax) piezoMax = raw;
 
@@ -219,7 +245,7 @@ void handlePiezoSensor() {
         } else {
           effectColor = pixels.Color(255, 0, 0);
         }
-        effectStart = nowMs;
+        effectStart = nowMs;                      // 照常记录（细节 A：渲染延至闪毕）
         effectUntil = nowMs + 220 + intensity * 70;
         if (DEBUG_IMPACT) {
           Serial.printf("[impact] swing=%d level=%u\n", swing, intensity);
@@ -239,16 +265,16 @@ void handlePiezoSensor() {
   }
   piezoLastPollUs = nowUs;
 
-  const int raw = analogRead(AO_PIN);
+  const int raw = analogRead(PIEZO_ADC_PIN);
 
   // 慢速跟踪静息电平：输出贴死在某条轨上时 rest 会跟过去，
   // 保证"从上轨向下掉"和"从下轨向上跳"都还能触发
-  if (nowUs - piezoLastRestUs >= PIEZO_REST_US) {
+  if (nowUs - piezoLastRestUs >= PIEZO_REST_UPDATE_US) {
     piezoLastRestUs = nowUs;
     piezoRest += (raw - piezoRest) / (1 << PIEZO_REST_SHIFT);
   }
 
-  // 双向触发：修复原版只认正向跳变、而实测撞击是负向跳变的问题
+  // 双向触发
   const int d = raw - piezoRest;
   if (d > PIEZO_TRIGGER || d < -PIEZO_TRIGGER) {
     piezoInWindow = true;
@@ -257,60 +283,253 @@ void handlePiezoSensor() {
     piezoMax = raw;
   }
 }
+
+// ---- 撞击响应渲染（M1 现状：中心脉冲，三档力度色）----
+void runPiezoEffect() {
+  uint32_t now = millis();
+  if (now >= effectUntil) {
+    clearPixels();
+    return;
+  }
+
+  // 从真实触发时刻(effectStart)起算衰减
+  const uint32_t duration = effectUntil - effectStart;
+  const uint32_t elapsed = now - effectStart;
+  const uint8_t pulse =
+      255 - (uint8_t)min((elapsed * 255) / duration, 255ul);
+
+  pixels.clear();
+  int center = LED_COUNT / 2;
+  for (uint8_t index = 0; index < LED_COUNT; ++index) {
+    int distance = abs(index - center);
+    if (distance < 6) {
+      uint8_t brightness = constrain(pulse - distance * 30, 0, 255);
+      pixels.setPixelColor(index, dimColor(effectColor, brightness));
+    }
+  }
+  pixels.show();
+}
+
+// ---- 预设五效果（交互规范 §4，台球主题）----
+void runPresetEffect() {
+  uint32_t now = millis();
+  if (now - lastPresetUpdate < 25) {
+    return;
+  }
+  lastPresetUpdate = now;
+
+  switch (presetIndex) {
+    case 0: {   // 彩虹流（基线保留）
+      for (uint8_t index = 0; index < LED_COUNT; ++index) {
+        pixels.setPixelColor(index, wheel((index * 256 / LED_COUNT + rainbowOffset) & 0xFF));
+      }
+      rainbowOffset += 4;
+      pixels.show();
+      break;
+    }
+    case 1: {   // 号球色板：30 灯 = 15 球 × 2 灯，静态摆球架（灯0=1号杆尾，灯29=15号杆头）
+      for (uint8_t index = 0; index < LED_COUNT; ++index) {
+        const uint8_t ball = index / 2 + 1;
+        if (ball <= 8) {
+          pixels.setPixelColor(index, ballColor(ball));
+        } else if (index % 2 == 0) {
+          pixels.setPixelColor(index, pixels.Color(220, 220, 220));  // 条纹球：白
+        } else {
+          pixels.setPixelColor(index, ballColor(ball - 8));          // 条纹球：本色
+        }
+      }
+      pixels.show();
+      break;
+    }
+    case 2: {   // 呼吸：台呢绿，沿用现波形（周期 5.1s）
+      uint8_t breathe = (now / 20) % 255;
+      if (breathe > 127) {
+        breathe = 255 - breathe;
+      }
+      pixels.fill(dimColor(pixels.Color(0, 150, 70), 70 + breathe));
+      pixels.show();
+      break;
+    }
+    case 3: {   // 追光扫描：白色母球单点往返，软尾迹 5 灯（60 帧/向）
+      pixels.clear();
+      pixels.setPixelColor(scanPos, pixels.Color(255, 255, 255));
+      for (uint8_t t = 1; t <= 5; ++t) {
+        const int8_t trail = scanPos - scanDir * (int8_t)t;
+        if (trail >= 0 && trail < LED_COUNT) {
+          pixels.setPixelColor(trail, dimColor(pixels.Color(255, 255, 255), 255 - t * 40));
+        }
+      }
+      pixels.show();
+
+      if (++scanHalf >= 2) {          // 2 帧/灯步 => 29 步 ≈ 60 帧/向 @25ms
+        scanHalf = 0;
+        const int8_t next = scanPos + scanDir;
+        if (next < 0 || next >= (int8_t)LED_COUNT) {
+          scanDir = -scanDir;
+        } else {
+          scanPos = next;
+        }
+      }
+      break;
+    }
+    case 4: {   // 击打闪光：中心 2 灯白核膨胀至 8 灯，360ms 衰减，随机 2.5-4s 重演
+      if (!striking) {
+        if (strikeNextAt == 0) {
+          strikeNextAt = now + 1500;  // 进档后 1.5s 首演
+        }
+        if (now >= strikeNextAt) {
+          striking = true;
+          strikeStart = now;
+        } else {
+          clearPixels();
+        }
+        break;
+      }
+      const uint32_t e = now - strikeStart;
+      if (e >= 360) {
+        striking = false;
+        strikeNextAt = now + random(2500, 4000);
+        clearPixels();
+        break;
+      }
+      const uint8_t half = min(e / 25, 3ul);        // 0..3：2 灯 -> 8 灯（11..18，中心对 14/15）
+      const uint8_t decay = 255 - (uint8_t)((e * 255) / 360);
+      pixels.clear();
+      const int left = LED_COUNT / 2 - 1 - half;
+      const int right = LED_COUNT / 2 + half;
+      for (int idx = left; idx <= right; ++idx) {
+        pixels.setPixelColor(idx, dimColor(pixels.Color(255, 255, 255), decay));
+      }
+      pixels.show();
+      break;
+    }
+    default:
+      presetIndex = 0;                              // 兜底，不产生黑档
+      break;
+  }
+}
+
+// ---- 按键轮询：消抖 + 短按（释放沿）+ 长按（按住 2s 触发一次）----
+PressEvent pollButton(Button &b) {
+  PressEvent ev = PressEvent::None;
+  const uint32_t now = millis();
+  const bool physical = digitalRead(b.pin) == (BUTTON_ACTIVE_LOW ? LOW : HIGH);
+
+  if (physical != b.rawPressed && now - b.lastEdgeMs >= BUTTON_DEBOUNCE_MS) {
+    b.lastEdgeMs = now;
+    b.rawPressed = physical;
+    if (physical) {
+      b.pressStartMs = now;                         // 按下沿
+      b.longFired = false;
+    } else if (!b.longFired &&
+               now - b.pressStartMs < BUTTON_LONGPRESS_MS) {
+      ev = PressEvent::Short;                       // 释放沿且未达长按 => 短按
+    }
+  }
+
+  if (b.rawPressed && !b.longFired &&
+      now - b.pressStartMs >= BUTTON_LONGPRESS_MS) {
+    b.longFired = true;
+    ev = PressEvent::Long;
+  }
+  return ev;
 }
 
 void handleButtons() {
-  if (readButtonPress(BUTTON_PIEZO, piezoButtonDebounce, piezoButtonPressed)) {
-    if (currentMode == LedMode::Piezo) {
-      currentMode = LedMode::Off;
-      clearPixels();
-    } else {
-      currentMode = LedMode::Piezo;
-      presetIndex = 0;
+  // 确认闪/渐灭期间按键扫描照常（规范 §2）
+  const PressEvent e1 = pollButton(btnEffect);
+  const PressEvent e2 = pollButton(btnMode);
+
+  if (e2 == PressEvent::Long) {                     // btn2 长按：灭灯待机（待机中无效）
+    if (mode != RuntimeMode::Standby) {
+      enterStandby();
     }
+    return;
   }
 
-  if (readButtonPress(BUTTON_PRESET, presetButtonDebounce, presetButtonPressed)) {
-    if (currentMode == LedMode::Preset) {
-      presetIndex = (presetIndex + 1) % 6;
-      if (presetIndex == 0) {
-        currentMode = LedMode::Off;
-        clearPixels();
-      }
+  if (e2 == PressEvent::Short) {                    // btn2 短按：互切 / 唤醒
+    if (mode == RuntimeMode::Standby) {
+      enterSensorMode();                            // 唤醒复用绿闪
+    } else if (mode == RuntimeMode::Sensor) {
+      enterPresetMode();
     } else {
-      currentMode = LedMode::Preset;
-      presetIndex = 0;
+      enterSensorMode();
     }
+    return;
   }
+
+  if (e1 == PressEvent::Short) {
+    if (mode == RuntimeMode::Standby) {
+      enterSensorMode();                            // 待机中任意短按唤醒
+    } else if (mode == RuntimeMode::Preset) {
+      presetIndex = (presetIndex + 1) % PRESET_COUNT;
+      resetPresetState();
+      lastPresetUpdate = 0;                         // 新效果立即渲染
+    }
+    // 传感器模式：M1 无动作（撞击风格切换留 M2，范围口径见冻结文档 §五#5）
+  }
+  // btn1 长按：键位语义预留（M3 现场重标定入口），M1 不实现
 }
+
+}  // namespace
 
 void cueControllerSetup() {
   Serial.begin(115200);
-  pinMode(AO_PIN, INPUT);
-  analogSetPinAttenuation(AO_PIN, ADC_11db);
-  pinMode(BUTTON_PIEZO, INPUT_PULLUP);
-  pinMode(BUTTON_PRESET, INPUT_PULLUP);
+  analogReadResolution(12);                         // 与 piezo_test 同口径（遗留件）
+  pinMode(PIEZO_ADC_PIN, INPUT);
+  analogSetPinAttenuation(PIEZO_ADC_PIN, ADC_11db);
+
+  if (BUTTON_ACTIVE_LOW) {
+    pinMode(BTN_MODE, INPUT_PULLUP);
+    pinMode(BTN_EFFECT, INPUT_PULLUP);
+  } else {
+    pinMode(BTN_MODE, INPUT_PULLDOWN);
+    pinMode(BTN_EFFECT, INPUT_PULLDOWN);
+  }
 
   pixels.begin();
-  pixels.setBrightness(255);
+  pixels.setBrightness(LED_BRIGHTNESS_MAX);         // 亮度帽（§2.6，USB 供电安全值）
   clearPixels();
 
-  // 静息电平初始化：取 64 次平均，比单次读数抗噪
-  long restSum = 0;
+  // 静息电平初始化：64 次平均，比单次读数抗噪（交接时用 32 次重播种）
+  uint32_t restSum = 0;
   for (int i = 0; i < 64; ++i) {
-    restSum += analogRead(AO_PIN);
+    restSum += analogRead(PIEZO_ADC_PIN);
     delay(2);
   }
   piezoRest = restSum / 64;
+
+  Serial.println();
+  Serial.println(F("[ecue] runtime firmware ready"));
+  Serial.println(F("[ecue] btn2 = mode switch (hold 2s = standby) | btn1 = cycle presets"));
+  Serial.printf("[ecue] boot mode = %s | LED_BRIGHTNESS_MAX = %u\n",
+                (mode == RuntimeMode::Sensor) ? "sensor" : "preset",
+                LED_BRIGHTNESS_MAX);
 }
 
 void cueControllerLoop() {
-  handleButtons();
-  handlePiezoSensor();
+  handleButtons();                                  // 闪/渐灭期间扫描照常
 
-  if (currentMode == LedMode::Piezo) {
+  if (mode == RuntimeMode::Sensor) {
+    handlePiezoSensor();                            // 引擎门控：仅传感器模式运行
+  }
+
+  // ---- 渲染仲裁 ----
+  if (piezoInWindow) {
+    return;                                         // P1-2/细节B：窗口期跳过一切 show()
+  }
+  if (fadeActive) {
+    fadeRenderFrame();
+    return;
+  }
+  if (flashActive) {
+    flashRenderFrame();                             // 确认闪优先（细节A：撞击渲染延至闪毕）
+    return;
+  }
+  if (mode == RuntimeMode::Sensor) {
     runPiezoEffect();
-  } else if (currentMode == LedMode::Preset) {
+  } else if (mode == RuntimeMode::Preset) {
     runPresetEffect();
   }
+  // 待机：渐灭结束后保持全灭，无渲染
 }
