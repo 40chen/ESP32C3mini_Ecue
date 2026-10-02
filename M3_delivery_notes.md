@@ -51,10 +51,10 @@ git diff d20e3ab..HEAD 仅 `include/piezo_config.h`（12 行）+ `src/cue_contro
 | partitions.bin | 3,072 | 148b959cbff1c38aa8e1d5c0ba9d612c54997b945e56a63f41223eef650653a1 | 55e59c3c |
 | firmware.bin | 279,264 | 9a8e400f1df83d1b819a72ee7d358e45bd415810cd7537290b1055fb9cc4ce8b | 7254b19c |
 
-路径：`.pio/build/esp32-c3-devkitm-1/`
+路径：`.pio/build/esp32-c3-devkitm-1/`（构建实物已随包交付：`flash_bin/` 三件套 + 根目录 `firmware.bin` 兜底件，上表即其实物锚点；zip 包级锚点——字节数/SHA-256/CRC-32——随包在群聊回传，供通用助手独立终核）
 
 ## 六、实测指引
 
-1. 烧录：`pio run -t upload`（或 esptool 烧三件套）；串口 115200，开机应打印 `[ecue] runtime firmware ready (M3)`
+1. 烧录：`pio run -t upload`（或 esptool 烧 `flash_bin/` 三件套）；串口 115200，开机应打印 `[ecue] runtime firmware ready (M3)`
 2. 开机恒进预设模式，NVS 恢复上次档位（0-10 越界自动回 0，无需迁移）
 3. 建议验证点：① 效果 1 末端两灯=母球纯白；② 传感器风格 2 重击满条=全条 32 灯；③ 0-10 全档断电往返记忆；④ 5-10 档逐档观察后报淘汰档位号
