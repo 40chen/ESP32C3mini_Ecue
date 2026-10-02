@@ -6,14 +6,14 @@
 // 口径依据（三方冻结，2026-09-30）：
 //   - 采样窗口 30ms（与标定 CSV 同口径，阈值 150/600/1500 免重标）
 //   - 消抖 40ms（沿用实测现码）
-//   - 亮度帽 40%（30 灯 WS2812 全白峰值约 1.8A，USB 供电必压降）
+//   - 亮度帽 40%（32 灯 WS2812 全白 @255 约 1.9A，USB 供电必压降；M3 灯数 30→32 已重算）
 // 修改本文件后需重新编译烧录（pio run）。
 // =====================================================================
 
 // ---- 灯条 ----
 constexpr uint8_t LED_PIN = 7;
-constexpr uint8_t LED_COUNT = 30;               // 30 颗口径，勿改（与 Esaber 31 颗结论无关）
-// 亮度帽：255=全亮（约 1.8A，仅外接 5V>=2A 时可用）；100=约 40%（USB 直供安全值）。
+constexpr uint8_t LED_COUNT = 32;               // M3：30→32 颗（20261002 拍板）；0-29 与旧版逐位等价，30/31=母球位
+// 亮度帽：255=全亮（32 灯约 1.9A，仅外接 5V>=2A 时可用）；100 约 0.75A（USB 直供安全值，32 灯口径）。
 constexpr uint8_t LED_BRIGHTNESS_MAX = 100;
 
 // ---- 按钮 ----
@@ -48,7 +48,7 @@ constexpr uint32_t HANDOVER_SILENCE_MS = 200;   // 进传感器模式交接静�
 constexpr uint8_t STYLE_COUNT = 4;
 constexpr uint32_t STYLE_S1_FLASH_MS = 60;      // S1 判定：全条白闪 60ms → 中心 12 灯力度色脉冲
 constexpr uint8_t  STYLE_S1_PULSE_SPAN = 6;     // S1 中心 12 灯（|index-center|<6，同 M1 现状）
-constexpr uint8_t  STYLE_S2_BAR[3] = {8, 16, 30};     // S2 力度→长度条（三档灯数）
+constexpr uint8_t  STYLE_S2_BAR[3] = {8, 16, 32};     // S2 力度→长度条（三档灯数；满条档 M3 随 32 灯适配）
 constexpr uint16_t STYLE_S3_SPEED_MPS[3] = {60, 90, 120};  // S3 波纹扩散波速（灯/秒，三档）
 constexpr uint32_t IMPACT_BASE_MS = 220;        // 撞击响应时长 = 220 + 70 × level（M1 现状，公共）
 constexpr uint32_t IMPACT_LEVEL_MS = 70;
@@ -57,11 +57,11 @@ constexpr uint32_t IMPACT_LEVEL_MS = 70;
 // 状态 0=绿闪 RGB(0,150,70) 60ms；S1=白闪 60ms（复用确认闪 FSM，单闪）；
 // S2/S3=复用各自渲染分支的合成触发，时长如下：
 constexpr uint32_t STYLE_HINT_S2_MS = 200;      // S2 迷你条快速衰减上限（规范 ≤200ms）
-constexpr uint32_t STYLE_HINT_S3_MS = 250;      // S3 单圈波纹（120 灯/s × 250ms = 30 灯整一圈）
+constexpr uint32_t STYLE_HINT_S3_MS = 267;      // S3 单圈波纹（120 灯/s × 267ms = 32 灯整一圈，M3 灯数适配）
 
 // ---- M2 力度连续映射（V2 §5.3，实现但默认关）----
 // 0=离散三档（C12 饱和削顶下离散更可信，默认）；1=启用 §5.3 连续映射：
-//   N=8+round((swing-150)/1350×22) 钳位[8,30]；S3 波速 60→120 灯/s 同式；
+//   N=8+round((swing-150)/1350×(LED_COUNT-8)) 钳位[8,LED_COUNT]（M3 随灯数自适应）；S3 波速 60→120 灯/s 同式；
 //   色相 青→黄→红 按 150/600/1500 三锚点分段线性；时长 220+round(t×210) ms；
 //   swing>1500 按 1500 封顶。标定数据到位后一行启用。
 #define STRIKE_CONTINUOUS 0

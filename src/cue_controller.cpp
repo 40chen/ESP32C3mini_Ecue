@@ -6,15 +6,18 @@
 #include "piezo_config.h"
 
 // =====================================================================
-// ECUE 运行时双模式固件（M2）
+// ECUE 运行时双模式固件（M3）
 //
-// 模式：传感器（压电引擎+撞击响应）/ 预设灯效（五效果循环）/ 待机（全灭）
+// 模式：传感器（压电引擎+撞击响应）/ 预设灯效（十一效果循环）/ 待机（全灭）
 // 按键：btn2(IO10) 短按互切模式、长按 2s 待机；
 //       btn1(IO0)  传感器模式内循环撞击风格（M2）/ 预设模式内循环效果（M1）；
 //                  长按语义已预留，现场重标定随 M3 落地。
 // 待机中任意短按唤醒回传感器模式。
 // 开机：恒进预设灯效模式（C 语义，V2 §5.6），NVS 恢复 effect/style 档位
 //       索引（§5.5），开机无确认闪——灯效即反馈。
+// M3（2026-10-02）：预设 5→11 档（5-10=开球爆散/母球游走/黑八环转/彩球进袋/
+//       星尘/火焰，六案全上管理员实测淘汰制）；灯珠 30→32（0-29 逐位等价，
+//       30/31=母球位）；S2 满条档、连续映射钳位随灯数自适应。
 // 参数见 piezo_config.h；交互口径见《ECUE_交互规范_设计匠人_20260930》V2。
 // =====================================================================
 
@@ -25,7 +28,7 @@ Adafruit_NeoPixel pixels(LED_COUNT, LED_PIN, NEO_GRB + NEO_KHZ800);
 // ---- 运行时模式 ----
 enum class RuntimeMode : uint8_t {
   Sensor,   // 传感器模式：压电引擎 + 撞击响应
-  Preset,   // 预设灯效模式：五效果循环
+  Preset,   // 预设灯效模式：十一效果循环
   Standby   // 待机：全灭
 };
 
@@ -35,7 +38,7 @@ RuntimeMode mode = RuntimeMode::Sensor;       // 真实开机模式由 setup 内
 constexpr bool DEBUG_IMPACT = true;           // 触发时打印 swing，标定完可改 false
 
 uint8_t presetIndex = 0;                      // 预设域档位记忆（来回切模式不重置）
-constexpr uint8_t PRESET_COUNT = 5;           // 五效果，无黑档；Off 语义移交 btn2 长按
+constexpr uint8_t PRESET_COUNT = 11;          // M3：0-4 基线 + 5-10 新增（A-F 六案全上），无黑档；Off 语义移交 btn2 长按
 uint32_t lastPresetUpdate = 0;                // 预设效果 25ms 渲染节流
 uint8_t styleIndex = 0;                       // 传感器域撞击风格档位（M2 四态循环）
 
@@ -63,7 +66,7 @@ uint8_t  hintStyle = 0xFF;                    // 0xFF=无提示在播
 uint32_t hintStart = 0;
 
 // ---- §5.3 连续映射公式（STRIKE_CONTINUOUS=1 时参与编译）----
-// N=8+round((swing-150)/1350×22) 钳位[8,30]；S3 波速 60→120 同式；
+// N=8+round((swing-150)/1350×(LED_COUNT-8)) 钳位[8,LED_COUNT]（M3：32 灯）；S3 波速 60→120 同式；
 // 色相 青→黄→红 按 150/600/1500 三锚点分段线性；时长 220+round(t×210) ms。
 #if STRIKE_CONTINUOUS
 uint32_t impactColorContinuous(uint16_t sw) {
@@ -81,7 +84,7 @@ uint32_t impactColorContinuous(uint16_t sw) {
 uint8_t spanFromSwing(uint16_t sw) {
   const float t = (float)(sw - PIEZO_TRIGGER) /
                   (float)(IMPACT_LEVEL2 - PIEZO_TRIGGER);
-  return (uint8_t)constrain(8 + (int)lroundf(t * 22), 8, 30);
+  return (uint8_t)constrain(8 + (int)lroundf(t * (LED_COUNT - 8)), 8, (int)LED_COUNT);
 }
 
 uint16_t speedFromSwing(uint16_t sw) {
@@ -135,6 +138,27 @@ bool     striking = false;                  // 效果4 击打闪光
 uint32_t strikeStart = 0;
 uint32_t strikeNextAt = 0;
 
+// ---- M3 效果5-10 状态（切档/切模式经 resetPresetState() 复位）----
+uint8_t  breakPhase = 0;                    // 效果5 开球爆散：0=击杆 1=白闪 2=爆散反弹 3=渐灭
+uint32_t breakPhaseStart = 0;
+int16_t  breakPos[15];                      // 粒子位置（1/8 灯定标）
+int16_t  breakVel[15];                      // 粒子速度（1/8 灯/帧，含符号）
+uint16_t breakFlags = 0;                    // bit i = 粒子 i 已反弹（仅反弹一次）
+int8_t   wanderPos = 0;                     // 效果6 母球游走（0..LED_COUNT-2）
+int8_t   wanderDir = 1;
+int8_t   wanderVel = 12;                    // 1/8 灯/帧，钳位 [4,16] = 0.5~2 灯/帧
+int8_t   wanderAcc = 0;                     // 亚像素累加器（满 8/8 进一灯）
+uint8_t  pocketPhase = 0;                   // 效果8 进袋：0=待机 1=滚动 2=端闪
+uint32_t pocketNextAt = 0;
+uint32_t pocketStart = 0;
+uint32_t pocketColor = 0;                   // 开滚时取的球色快照
+uint8_t  pocketBall = 1;                    // 球号 1..15
+int8_t   pocketDir = 1;                     // 滚动方向 +1/-1
+uint8_t  dustId[LED_COUNT];                 // 效果9 星尘：0=灭 1=暖白 2..9=球色1..8
+uint8_t  dustLife[LED_COUNT];               // 星尘剩余寿命（255→0，约 400ms）
+int8_t   flameHeight = 9;                   // 效果10 焰高（8-10 灯，缓变）
+uint32_t flameNextShift = 0;                // 下次焰高突变时刻
+
 uint32_t wheel(uint8_t position) {
   position = 255 - position;
   if (position < 85) {
@@ -176,6 +200,30 @@ uint32_t ballColor(uint8_t ball) {
   }
 }
 
+// 动态效果用球色（8 号炭灰提亮防隐形；条纹球取本色代表）
+uint32_t ballVisible(uint8_t ball) {
+  if (ball == 8) {
+    return pixels.Color(70, 70, 70);
+  }
+  return ballColor(ball <= 8 ? ball : ball - 8);
+}
+
+// 开球粒子配色：i=0..14 → 1-7 全色 / 8 号 / 9-15 条纹本色
+uint32_t burstColor(uint8_t i) {
+  if (i == 7) {
+    return ballVisible(8);
+  }
+  return (i < 7) ? ballColor(i + 1) : ballColor(i - 7);
+}
+
+// 星尘配色：1=暖白，2..9 = 球色 1..8
+uint32_t dustColorOf(uint8_t id) {
+  if (id == 1) {
+    return pixels.Color(255, 220, 170);
+  }
+  return ballVisible(id - 1);
+}
+
 void resetPresetState() {
   rainbowOffset = 0;
   scanPos = 0;
@@ -184,6 +232,24 @@ void resetPresetState() {
   striking = false;
   strikeStart = 0;
   strikeNextAt = 0;
+  // ---- M3 效果5-10 ----
+  breakPhase = 0;
+  breakPhaseStart = 0;
+  breakFlags = 0;
+  wanderPos = (int8_t)(LED_COUNT / 2);
+  wanderDir = 1;
+  wanderVel = 12;
+  wanderAcc = 0;
+  pocketPhase = 0;
+  pocketNextAt = 0;
+  pocketColor = 0;
+  pocketDir = 1;
+  flameHeight = 9;
+  flameNextShift = 0;
+  for (uint8_t i = 0; i < LED_COUNT; ++i) {
+    dustId[i] = 0;
+    dustLife[i] = 0;
+  }
 }
 
 // ---- NVS 断电记忆（V2 §5.5）----
@@ -429,8 +495,8 @@ uint16_t activeSpeed() {
 // ---- S2/S3 绘制（撞击渲染与 §5.4 提示共用；参数已快照，全量重画无需清屏）----
 void drawS2Bar(uint32_t color, uint8_t pulse, uint8_t span) {
   const int center = LED_COUNT / 2;
-  const int from = center - span / 2;             // 8 灯=11..18（同 M1 击打口径）
-  const int to = from + span - 1;                 // 16=7..22 / 30=0..29
+  const int from = center - span / 2;             // 8 灯=12..19（32 灯口径；M1 30 灯时为 11..18）
+  const int to = from + span - 1;                 // 16=8..23 / 32=0..31（满条）
   for (uint8_t index = 0; index < LED_COUNT; ++index) {
     if (index >= from && index <= to) {
       pixels.setPixelColor(index, dimColor(color, pulse));
@@ -524,7 +590,7 @@ bool runPiezoEffect() {
 }
 
 // ---- §5.4 风格切换提示（微缩演示版）：S2=中心迷你条快衰减 ≤200ms；
-// S3=单圈快速波纹 ≤250ms（120 灯/s × 250ms = 30 灯整一圈）。
+// S3=单圈快速波纹 ≤267ms（120 灯/s × 267ms = 32 灯整一圈，M3 灯数适配）。
 // 复用撞击绘制函数合成触发，不占 effectUntil（与撞击状态机完全隔离）。
 // 仲裁位置：flash/fade 之下、撞击空闲时才播；再次短按即打断进下一态。
 void startStyleHint(uint8_t style) {
@@ -555,7 +621,7 @@ void hintRenderFrame() {
   pixels.show();
 }
 
-// ---- 预设五效果（交互规范 §4，台球主题）----
+// ---- 预设十一效果（0-4 基线保留 + 5-10 M3 新增；25ms 节流，全 millis() 非阻塞）----
 void runPresetEffect() {
   uint32_t now = millis();
   if (now - lastPresetUpdate < 25) {
@@ -572,8 +638,8 @@ void runPresetEffect() {
       pixels.show();
       break;
     }
-    case 1: {   // 号球色板：30 灯 = 15 球 × 2 灯，静态摆球架（灯0=1号杆尾，灯29=15号杆头）
-      for (uint8_t index = 0; index < LED_COUNT; ++index) {
+    case 1: {   // 号球色板：32 灯 = 15 球 × 2 灯（0-29 与 30 灯版逐位等价）+ 杆端母球纯白 ×2
+      for (uint8_t index = 0; index < LED_COUNT - 2; ++index) {
         const uint8_t ball = index / 2 + 1;
         if (ball <= 8) {
           pixels.setPixelColor(index, ballColor(ball));
@@ -583,6 +649,8 @@ void runPresetEffect() {
           pixels.setPixelColor(index, ballColor(ball - 8));          // 条纹球：本色
         }
       }
+      pixels.setPixelColor(LED_COUNT - 2, pixels.Color(255, 255, 255));  // 母球（纯白）
+      pixels.setPixelColor(LED_COUNT - 1, pixels.Color(255, 255, 255));
       pixels.show();
       break;
     }
@@ -637,13 +705,252 @@ void runPresetEffect() {
         clearPixels();
         break;
       }
-      const uint8_t half = min(e / 25, 3ul);        // 0..3：2 灯 -> 8 灯（11..18，中心对 14/15）
+      const uint8_t half = min(e / 25, 3ul);        // 0..3：2 灯 -> 8 灯（12..19，中心对 15/16，32 灯口径）
       const uint8_t decay = 255 - (uint8_t)((e * 255) / 360);
       pixels.clear();
       const int left = LED_COUNT / 2 - 1 - half;
       const int right = LED_COUNT / 2 + half;
       for (int idx = left; idx <= right; ++idx) {
         pixels.setPixelColor(idx, dimColor(pixels.Color(255, 255, 255), decay));
+      }
+      pixels.show();
+      break;
+    }
+    case 5: {   // M3·A 开球爆散：白块加速击杆→全条白闪80ms→15球色粒子喷散+端点反弹→渐灭，周期约3.5s
+      const uint32_t e = now - breakPhaseStart;
+      if (breakPhase == 0) {                        // 击杆：4 灯白块自杆端(0)加速冲向中心
+        if (e >= 600) {
+          breakPhase = 1;
+          breakPhaseStart = now;
+          break;
+        }
+        const int32_t p = (int32_t)((e * e) * (LED_COUNT / 2) / (600 * 600));  // 二次缓入=加速
+        pixels.clear();
+        for (int idx = p - 3; idx <= p && idx < LED_COUNT; ++idx) {
+          if (idx >= 0) {
+            pixels.setPixelColor(idx, pixels.Color(255, 255, 255));
+          }
+        }
+        pixels.show();
+        break;
+      }
+      if (breakPhase == 1) {                        // 全条白闪 80ms → 粒子初始化
+        if (e >= 80) {
+          for (uint8_t i = 0; i < 15; ++i) {
+            breakPos[i] = (LED_COUNT / 2) * 8;      // 自中心喷出（1/8 灯定标）
+            const int vel = (int)random(16, 27);    // 2~3.4 灯/帧 起速
+            breakVel[i] = (i < 8) ? (int16_t)vel : (int16_t)-vel;
+          }
+          breakFlags = 0;
+          breakPhase = 2;
+          breakPhaseStart = now;
+          break;
+        }
+        pixels.fill(pixels.Color(255, 255, 255));
+        pixels.show();
+        break;
+      }
+      if (breakPhase == 2) {                        // 爆散：喷散+衰减，端点反弹一次（速度×0.7）
+        pixels.clear();
+        bool allRest = true;
+        for (uint8_t i = 0; i < 15; ++i) {
+          if (breakVel[i] != 0) {
+            allRest = false;
+            breakPos[i] += breakVel[i];
+            breakVel[i] = breakVel[i] * 95 / 100;   // 线性速度衰减
+            const int p = breakPos[i] >> 3;
+            const int sign = (breakVel[i] >= 0) ? 1 : -1;
+            if (p <= 0 || p >= LED_COUNT - 1) {     // 触端：首次反弹，二触停壁
+              if ((breakFlags & (1 << i)) == 0) {
+                breakFlags |= (uint16_t)(1 << i);
+                breakVel[i] = (int16_t)(-breakVel[i] * 7 / 10);
+                breakPos[i] = (int16_t)constrain(breakPos[i], 0, (LED_COUNT - 1) * 8);
+              } else {
+                breakVel[i] = 0;
+              }
+            }
+            if (breakVel[i] != 0) {
+              const int q = constrain((int)(breakPos[i] >> 3), 0, LED_COUNT - 1);
+              const uint32_t col = burstColor(i);
+              pixels.setPixelColor(q, col);
+              const int trail = q - sign;           // 30% 衰减拖尾
+              if (trail >= 0 && trail < LED_COUNT) {
+                pixels.setPixelColor(trail, dimColor(col, 77));
+              }
+            }
+          }
+        }
+        if (allRest || e >= 2200) {
+          breakPhase = 3;
+          breakPhaseStart = now;
+        }
+        pixels.show();
+        break;
+      }
+      // 阶段3：渐灭 600ms → 回到击杆（全程约 3.5s 循环）
+      if (e >= 600) {
+        breakPhase = 0;
+        breakPhaseStart = now;
+        break;
+      }
+      const uint8_t fadeK = 255 - (uint8_t)((e * 255) / 600);
+      pixels.clear();
+      for (uint8_t i = 0; i < 15; ++i) {
+        const int q = constrain((int)(breakPos[i] >> 3), 0, LED_COUNT - 1);
+        pixels.setPixelColor(q, dimColor(burstColor(i), fadeK));
+      }
+      pixels.show();
+      break;
+    }
+    case 6: {   // M3·B 母球游走：2 灯白点 + 3 灯软尾迹(40%/20%/8%)，惯性随机漫步 0.5~2 灯/帧，端点反弹
+      wanderVel += (int8_t)random(-1, 2);           // 惯性漫步：速度每帧漂移 ±1/8 灯
+      if (wanderVel < 4) {
+        wanderVel = 4;
+      }
+      if (wanderVel > 16) {
+        wanderVel = 16;
+      }
+      wanderAcc += wanderVel;
+      while (wanderAcc >= 8) {                      // 累满 1/8×8 → 进一灯
+        wanderAcc -= 8;
+        const int8_t next = wanderPos + wanderDir;
+        if (next < 0 || next > LED_COUNT - 2) {     // 预留 2 灯头位，端点反弹
+          wanderDir = -wanderDir;
+        } else {
+          wanderPos = next;
+        }
+      }
+      pixels.clear();
+      pixels.setPixelColor(wanderPos, pixels.Color(255, 255, 255));
+      const int8_t lead = wanderPos + wanderDir;
+      if (lead >= 0 && lead < LED_COUNT) {
+        pixels.setPixelColor(lead, dimColor(pixels.Color(255, 255, 255), 210));
+      }
+      for (uint8_t t = 1; t <= 3; ++t) {
+        const int8_t tail = wanderPos - wanderDir * (int8_t)t;
+        if (tail >= 0 && tail < LED_COUNT) {
+          const uint8_t tb = (t == 1) ? 102 : (t == 2) ? 51 : 20;   // 40%/20%/8%
+          pixels.setPixelColor(tail, dimColor(pixels.Color(255, 255, 255), tb));
+        }
+      }
+      pixels.show();
+      break;
+    }
+    case 7: {   // M3·C 黑八环转：中心 4 灯炭灰慢呼吸(2s)，两侧 14 灯球色块镜像外旋（约 1s/格）
+      const uint32_t cyc = now % 2000;              // 2s 呼吸周期（三角波）
+      const uint32_t tri = (cyc < 1000) ? cyc : 2000 - cyc;
+      pixels.clear();
+      for (uint8_t k = 0; k < LED_COUNT / 2 - 2; ++k) {   // 每侧 14 灯，2 灯/格 × 7 格循环
+        const uint8_t blockIdx = (uint8_t)((k / 2 + now / 1000) % 7);   // 向两端外旋
+        const uint32_t col = ballColor(blockIdx + 1);
+        pixels.setPixelColor((uint8_t)(LED_COUNT / 2 - 2 - k), col);    // 左侧向杆端
+        pixels.setPixelColor((uint8_t)(LED_COUNT / 2 + 1 + k), col);    // 右侧镜像向杆头
+      }
+      const uint8_t breath = (uint8_t)(60 + tri * 140 / 1000);
+      for (uint8_t idx = LED_COUNT / 2 - 2; idx <= LED_COUNT / 2 + 1; ++idx) {
+        pixels.setPixelColor(idx, dimColor(pixels.Color(40, 40, 40), breath));  // 炭灰慢呼吸
+      }
+      pixels.show();
+      break;
+    }
+    case 8: {   // M3·D 彩球进袋：每 4~6s 随机球色单球滚过全条(约1.2s)→对端 3 灯连闪 2 下(间隔150ms)
+      if (pocketPhase == 0) {                       // 待机
+        if (pocketNextAt == 0) {
+          pocketNextAt = now + 1200;                // 进档后 1.2s 首演
+        }
+        if (now >= pocketNextAt) {
+          pocketBall = (uint8_t)random(1, 16);
+          pocketDir = (random(0, 2) == 0) ? 1 : -1;
+          pocketColor = ballVisible(pocketBall);
+          pocketStart = now;
+          pocketPhase = 1;
+        } else {
+          clearPixels();
+        }
+        break;
+      }
+      if (pocketPhase == 1) {                       // 滚动：0 ↔ LED_COUNT-1，约 1.2s
+        const uint32_t e = now - pocketStart;
+        if (e >= 1200) {
+          pocketPhase = 2;
+          pocketStart = now;
+          break;
+        }
+        const int32_t progress = (int32_t)(e * (LED_COUNT - 1) / 1200);
+        const int p = (pocketDir == 1) ? progress : (LED_COUNT - 1 - progress);
+        pixels.clear();
+        pixels.setPixelColor(p, pocketColor);
+        if (p + 1 < LED_COUNT) {
+          pixels.setPixelColor(p + 1, dimColor(pocketColor, 140));   // 球身 2 灯
+        }
+        if (p >= 1) {
+          pixels.setPixelColor(p - 1, dimColor(pocketColor, 60));    // 尾迹
+        }
+        pixels.show();
+        break;
+      }
+      // 端闪：入袋端 3 灯连闪 2 下（亮 150/灭 150 ×2，共 600ms）
+      const uint32_t e = now - pocketStart;
+      if (e >= 600) {
+        pocketPhase = 0;
+        pocketNextAt = now + random(2200, 4200);    // 整周期约 4~6s
+        break;
+      }
+      pixels.clear();
+      if (e % 300 < 150) {
+        const int base = (pocketDir == 1) ? LED_COUNT - 3 : 0;
+        for (int idx = base; idx < base + 3; ++idx) {
+          pixels.setPixelColor(idx, pocketColor);
+        }
+      }
+      pixels.show();
+      break;
+    }
+    case 9: {   // M3·E 星尘：每帧 5% 概率随机点亮 1 灯（暖白/球色），400ms 渐灭，最省电
+      if (random(0, 100) < 5) {
+        const uint8_t idx = (uint8_t)random(0, LED_COUNT);
+        if (dustLife[idx] == 0) {
+          dustId[idx] = (uint8_t)random(1, 10);     // 1=暖白 2..9=球色 1..8
+          dustLife[idx] = 255;
+        }
+      }
+      pixels.clear();
+      for (uint8_t i = 0; i < LED_COUNT; ++i) {
+        if (dustLife[i] > 0) {
+          pixels.setPixelColor(i, dimColor(dustColorOf(dustId[i]), dustLife[i]));
+          dustLife[i] = (dustLife[i] > 16) ? (uint8_t)(dustLife[i] - 16) : 0;   // 400ms @25ms 帧
+        }
+      }
+      pixels.show();
+      break;
+    }
+    case 10: {  // M3·F 火焰：杆端 8-10 灯深红→橙→黄尖梯度，低频摇曳叠加每帧随机抖动，焰高缓变
+      if (now >= flameNextShift) {                  // 焰高缓变：约每 0.7-1.3s ±1 灯
+        flameHeight = (int8_t)constrain(flameHeight + (int)random(-1, 2), 8, 10);
+        flameNextShift = now + 700 + random(0, 600);
+      }
+      pixels.clear();
+      for (uint8_t i = 0; i < 10; ++i) {
+        if (i >= flameHeight) {
+          break;
+        }
+        const uint8_t g = (uint8_t)((i * 255) / (flameHeight - 1));   // 0=底部 → 255=焰尖
+        uint8_t r, gc, b;
+        if (g < 140) {                              // 深红(150,15,0) → 橙(255,90,0)
+          const uint8_t u = (uint8_t)(g * 255 / 140);
+          r = (uint8_t)(150 + 105 * u / 255);
+          gc = (uint8_t)(15 + 75 * u / 255);
+          b = 0;
+        } else {                                    // 橙(255,90,0) → 黄尖(255,210,60)
+          const uint8_t u = (uint8_t)((g - 140) * 255 / 115);
+          r = 255;
+          gc = (uint8_t)(90 + 120 * u / 255);
+          b = (uint8_t)(60 * u / 255);
+        }
+        const uint8_t ph = (uint8_t)((now / 6 + i * 29) & 0xFF);      // 低频摇曳（相位随灯错开）
+        const uint8_t sway = (ph < 128) ? (uint8_t)(ph * 2) : (uint8_t)((255 - ph) * 2);
+        int bright = constrain(150 + sway * 40 / 255 + (int)random(-25, 26), 40, 255);
+        pixels.setPixelColor(i, dimColor(pixels.Color(r, gc, b), (uint8_t)bright));
       }
       pixels.show();
       break;
@@ -754,7 +1061,7 @@ void cueControllerSetup() {
   loadImpactState();
 
   Serial.println();
-  Serial.println(F("[ecue] runtime firmware ready (M2)"));
+  Serial.println(F("[ecue] runtime firmware ready (M3)"));
   Serial.println(F("[ecue] boot -> preset mode (C semantics) | NVS restore effect/style"));
   Serial.printf("[ecue] effect=%u style=%u | LED_BRIGHTNESS_MAX = %u\n",
                 presetIndex, styleIndex, LED_BRIGHTNESS_MAX);
