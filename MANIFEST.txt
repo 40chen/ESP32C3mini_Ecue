@@ -1,0 +1,30 @@
+ECUE M3 delivery package - 20261002
+====================================
+
+CONTENTS
+  src/ include/ platformio.ini README.md LICENSE
+                             PlatformIO project (esp32-c3-devkitm-1), git history
+                             included (.git/); HEAD = 1658dce
+                             chain: d20e3ab (M2 base) -> 658d470 (M3 code) ->
+                             29c0af0 -> 1658dce (docs/packaging only, source untouched)
+  flash_bin/bootloader.bin   13,200 B   stage @ 0x0
+  flash_bin/partitions.bin    3,072 B   stage @ 0x8000
+  flash_bin/firmware.bin   279,264 B   stage @ 0x10000  (ESP32-C3)
+  firmware.bin               bare firmware.bin fallback == flash_bin/firmware.bin
+  M3_delivery_notes.md       delivery notes: preset table / 30->32 adaptation /
+                             sensor-domain untouched statement / anchors / test guide
+
+RENAME NOTE (packaging rule: ASCII entry names only)
+  M3_delivery_notes.md  ==  original CN name "M3_交付说明.md"
+
+M3 SCOPE NOTE
+  Presets 5 -> 11 (A-F six new LED effects, admin decision "六案全上")
+  + LED count 30 -> 32. Piezo engine / thresholds / C12 / NVS layout untouched
+  (sensor domain zero-diff). Boot banner: [ecue] runtime firmware ready (M3)
+
+FIRMWARE ANCHORS (in-package, verified)
+  bootloader.bin : bytes=13200   SHA-256=b800a76c85c19db0bf5e40331d11736feae2c783d70d36f4d2b6fd8bda0ec32e  CRC-32=B84D4A4D (IEEE/zlib)
+  partitions.bin : bytes=3072    SHA-256=148b959cbff1c38aa8e1d5c0ba9d612c54997b945e56a63f41223eef650653a1  CRC-32=55E59C3C (IEEE/zlib)
+  firmware.bin   : bytes=279264  SHA-256=9a8e400f1df83d1b819a72ee7d358e45bd415810cd7537290b1055fb9cc4ce8b  CRC-32=7254B19C (IEEE/zlib)
+  zip-level anchors (bytes / SHA-256 / CRC-32 of the zip itself) are posted in
+  the group chat for independent verification.
