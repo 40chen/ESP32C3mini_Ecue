@@ -6,7 +6,8 @@
 #include "piezo_config.h"
 
 // =====================================================================
-// ECUE 运行时双模式固件（M3）
+// ECUE 运行时固件（M4）
+// 预设灯效（11 档）/ 传感器撞击响应（四态风格）/ 亮度调节（四档）/ 待机
 //
 // 模式：传感器（压电引擎+撞击响应）/ 预设灯效（十一效果循环）/ 亮度调节 / 待机（全灭）
 // 按键：btn2(IO10) 短按互切模式、长按 2s 待机；
@@ -1298,8 +1299,8 @@ void cueControllerSetup() {
   loadImpactState();
 
   Serial.println();
-  Serial.println(F("[ecue] runtime firmware ready (M3)"));
-  Serial.println(F("[ecue] boot -> preset mode (C semantics) | NVS restore effect/style"));
+  Serial.println(F("[ecue] runtime firmware ready (M4)"));
+  Serial.println(F("[ecue] boot -> preset mode (C semantics) | NVS restore effect/style/bright"));
   Serial.printf("[ecue] effect=%u style=%u bright=%u (idx %u/%u)\n",
                 presetIndex, styleIndex, BRIGHT_LEVELS[brightnessIndex],
                 brightnessIndex, BRIGHT_LEVEL_COUNT);

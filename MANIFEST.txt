@@ -1,30 +1,38 @@
-ECUE M3 delivery package - 20261002
+ECUE M4 delivery package - 20261003
 ====================================
 
 CONTENTS
   src/ include/ platformio.ini README.md LICENSE
                              PlatformIO project (esp32-c3-devkitm-1), git history
-                             included (.git/); HEAD = 1658dce
-                             chain: d20e3ab (M2 base) -> 658d470 (M3 code) ->
-                             29c0af0 -> 1658dce (docs/packaging only, source untouched)
+                             included (.git/); HEAD = <COMMIT-TBD> (branch
+                             feature/m4-brightness-reseed)
+                             chain: b2484bb (M3) -> 4053d32 (M4 code) ->
+                             <DOCS-TBD> (docs/packaging only, source untouched
+                             except boot banner version string)
   flash_bin/bootloader.bin   13,200 B   stage @ 0x0
   flash_bin/partitions.bin    3,072 B   stage @ 0x8000
-  flash_bin/firmware.bin   279,264 B   stage @ 0x10000  (ESP32-C3)
+  flash_bin/firmware.bin   281,120 B   stage @ 0x10000  (ESP32-C3)
   firmware.bin               bare firmware.bin fallback == flash_bin/firmware.bin
-  M3_delivery_notes.md       delivery notes: preset table / 30->32 adaptation /
-                             sensor-domain untouched statement / anchors / test guide
+  M4_delivery_notes.md       delivery notes: keymap final table / brightness spec /
+                             reseed flow / MAX->runtime migration map / NVS 4-field
+                             compat / anchors / acceptance checklist
 
 RENAME NOTE (packaging rule: ASCII entry names only)
-  M3_delivery_notes.md  ==  original CN name "M3_交付说明.md"
+  M4_delivery_notes.md  ==  original CN name "M4_交付说明.md"
 
-M3 SCOPE NOTE
-  Presets 5 -> 11 (A-F six new LED effects, admin decision "六案全上")
-  + LED count 30 -> 32. Piezo engine / thresholds / C12 / NVS layout untouched
-  (sensor domain zero-diff). Boot banner: [ecue] runtime firmware ready (M3)
+M4 SCOPE NOTE
+  Brightness 4 levels 50/100/150/200 (btn1 long-press 2s, scale display,
+  NVS persisted, default 100) + field recalibration via dual-button combo
+  (150ms window, 500ms hold, breathing->progress bar->double flash).
+  7 hardcoded LED_BRIGHTNESS_MAX sites migrated to runtime level;
+  NVS payload 3->4 bytes with legacy-3-byte compatibility.
+  Piezo engine / thresholds / C12 hardware notes untouched.
+  Boot banner: [ecue] runtime firmware ready (M4)
+  Interaction spec: shared/亮度与重标定-交互口径稿-v2.1.md (v2.1 final)
 
 FIRMWARE ANCHORS (in-package, verified)
-  bootloader.bin : bytes=13200   SHA-256=b800a76c85c19db0bf5e40331d11736feae2c783d70d36f4d2b6fd8bda0ec32e  CRC-32=B84D4A4D (IEEE/zlib)
-  partitions.bin : bytes=3072    SHA-256=148b959cbff1c38aa8e1d5c0ba9d612c54997b945e56a63f41223eef650653a1  CRC-32=55E59C3C (IEEE/zlib)
-  firmware.bin   : bytes=279264  SHA-256=9a8e400f1df83d1b819a72ee7d358e45bd415810cd7537290b1055fb9cc4ce8b  CRC-32=7254B19C (IEEE/zlib)
+  bootloader.bin : bytes=13200   SHA-256=b800a76c85c19db0bf5e40331d11736feae2c783d70d36f4d2b6fd8bda0ec32e  CRC-32=B84D4A4D (IEEE/zlib)  [== M3, unchanged]
+  partitions.bin : bytes=3072    SHA-256=148b959cbff1c38aa8e1d5c0ba9d612c54997b945e56a63f41223eef650653a1  CRC-32=55E59C3C (IEEE/zlib)  [== M3, unchanged]
+  firmware.bin   : bytes=281120  SHA-256=895ae6bd30fda49067db4de5444de1cb02480ba47e6981f60ec022116c4ec5db  CRC-32=3DCFB07F (IEEE/zlib)
   zip-level anchors (bytes / SHA-256 / CRC-32 of the zip itself) are posted in
   the group chat for independent verification.
