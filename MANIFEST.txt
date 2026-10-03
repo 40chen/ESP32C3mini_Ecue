@@ -4,11 +4,11 @@ ECUE M4 delivery package - 20261003
 CONTENTS
   src/ include/ platformio.ini README.md LICENSE
                              PlatformIO project (esp32-c3-devkitm-1), git history
-                             included (.git/); HEAD = <COMMIT-TBD> (branch
-                             feature/m4-brightness-reseed)
-                             chain: b2484bb (M3) -> 4053d32 (M4 code) ->
-                             <DOCS-TBD> (docs/packaging only, source untouched
-                             except boot banner version string)
+                             included (.git/); packaged HEAD = this MANIFEST
+                             commit (see git log), chain:
+                             b2484bb (M3) -> 4053d32 (M4 code) ->
+                             f84705e (README rewrite + M4 notes + boot banner M4)
+                             -> MANIFEST commit (this file, packaging only)
   flash_bin/bootloader.bin   13,200 B   stage @ 0x0
   flash_bin/partitions.bin    3,072 B   stage @ 0x8000
   flash_bin/firmware.bin   281,120 B   stage @ 0x10000  (ESP32-C3)
