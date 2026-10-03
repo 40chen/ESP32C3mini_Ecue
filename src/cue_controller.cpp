@@ -8,16 +8,20 @@
 // =====================================================================
 // ECUE 运行时双模式固件（M3）
 //
-// 模式：传感器（压电引擎+撞击响应）/ 预设灯效（十一效果循环）/ 待机（全灭）
+// 模式：传感器（压电引擎+撞击响应）/ 预设灯效（十一效果循环）/ 亮度调节 / 待机（全灭）
 // 按键：btn2(IO10) 短按互切模式、长按 2s 待机；
 //       btn1(IO0)  传感器模式内循环撞击风格（M2）/ 预设模式内循环效果（M1）；
-//                  长按语义已预留，现场重标定随 M3 落地。
-// 待机中任意短按唤醒回传感器模式。
+//                  长按 2s 进亮度模式（M4，原重标定预留让位）；
+//       双键同按 ≥500ms = 现场重标定（M4，组合期屏蔽两键单触/长按）。
+// 待机中任意短按/长按唤醒回传感器模式（待机互斥：不进亮度模式、不做组合判定）。
 // 开机：恒进预设灯效模式（C 语义，V2 §5.6），NVS 恢复 effect/style 档位
 //       索引（§5.5），开机无确认闪——灯效即反馈。
 // M3（2026-10-02）：预设 5→11 档（5-10=开球爆散/母球游走/黑八环转/彩球进袋/
 //       星尘/火焰，六案全上管理员实测淘汰制）；灯珠 30→32（0-29 逐位等价，
 //       30/31=母球位）；S2 满条档、连续映射钳位随灯数自适应。
+// M4（2026-10-03）：亮度四档 50/100/150/200（出厂默认 100，NVS 记忆，渐灭/恢复
+//       用当前档）；现场重标定=双键同按（呼吸→进度条 32 采样→白双闪）；
+//       反向循环不加（08:10 拍板）。交互口径：《亮度与重标定-交互口径稿-v2》。
 // 参数见 piezo_config.h；交互口径见《ECUE_交互规范_设计匠人_20260930》V2。
 // =====================================================================
 
@@ -27,9 +31,10 @@ Adafruit_NeoPixel pixels(LED_COUNT, LED_PIN, NEO_GRB + NEO_KHZ800);
 
 // ---- 运行时模式 ----
 enum class RuntimeMode : uint8_t {
-  Sensor,   // 传感器模式：压电引擎 + 撞击响应
-  Preset,   // 预设灯效模式：十一效果循环
-  Standby   // 待机：全灭
+  Sensor,       // 传感器模式：压电引擎 + 撞击响应
+  Preset,       // 预设灯效模式：十一效果循环
+  BrightAdjust, // 亮度调节模式（M4）：btn1 长按 2s 进入，刻度尺调档，2s 无操作保存退出
+  Standby       // 待机：全灭
 };
 
 RuntimeMode mode = RuntimeMode::Sensor;       // 真实开机模式由 setup 内 enterPresetMode
@@ -41,6 +46,11 @@ uint8_t presetIndex = 0;                      // 预设域档位记忆（来回�
 constexpr uint8_t PRESET_COUNT = 11;          // M3：0-4 基线 + 5-10 新增（A-F 六案全上），无黑档；Off 语义移交 btn2 长按
 uint32_t lastPresetUpdate = 0;                // 预设效果 25ms 渲染节流
 uint8_t styleIndex = 0;                       // 传感器域撞击风格档位（M2 四态循环）
+uint8_t brightnessIndex = BRIGHT_DEFAULT_INDEX;  // 亮度档（M4 四档；NVS 持久化，出厂默认 100）
+RuntimeMode brightReturnMode = RuntimeMode::Preset;  // 亮度模式退出后轻量返回的模式
+uint32_t brightLastActionMs = 0;              // 亮度模式内最后交互时刻（2s 无操作退出）
+uint32_t brightNextStepMs = 0;                // 连发下一拍时刻
+int8_t   brightHoldDir = 0;                   // 连发方向：+1=btn1 升 / -1=btn2 降 / 0=无
 
 // ---- 压电引擎状态 ----
 uint32_t piezoLastPollUs = 0;
@@ -111,7 +121,7 @@ constexpr uint32_t FLASH_PERIOD_MS = FLASH_ON_MS + FLASH_OFF_MS;
 // ---- 待机渐灭 FSM（不清缓冲区，靠降全局亮度实现"从当前亮度线性降 0"）----
 bool     fadeActive = false;
 uint32_t fadeStart = 0;
-uint8_t  fadeFrom = LED_BRIGHTNESS_MAX;
+uint8_t  fadeFrom = BRIGHT_LEVELS[BRIGHT_DEFAULT_INDEX];   // 渐灭起点初值（实际由 startStandbyFade 按当前档刷新）
 
 // ---- 按键驱动（消抖 40ms + 短按释放判定 + 2s 长按）----
 enum class PressEvent : uint8_t { None, Short, Long };
@@ -128,6 +138,19 @@ struct Button {
 
 Button btnEffect{BTN_EFFECT};   // btn1
 Button btnMode{BTN_MODE};       // btn2
+
+// ---- M4 双键同按重标定 FSM + 按下沿跟踪（待机/亮度模式内不启用组合判定）----
+enum class ComboState : uint8_t { Idle, Pending, Cancel, Flow };
+ComboState comboState = ComboState::Idle;
+uint32_t comboStartMs = 0;                    // 双键均按住时刻（500ms 保持计时起点）
+bool prevHeld1 = false;                       // 上一轮按住态（按下沿检测用）
+bool prevHeld2 = false;
+bool reseedFlowActive = false;                // 重标定流程渲染接管标志
+uint8_t  reseedPhase = 0;                     // 0=慢呼吸 1=进度条采样 2=满条收尾
+uint32_t reseedPhaseStart = 0;
+uint32_t reseedNextSampleMs = 0;
+uint8_t  reseedSampleCount = 0;
+uint32_t reseedSum = 0;
 
 // ---- 预设效果内部状态（切档/切模式时经 resetPresetState() 复位）----
 uint8_t  rainbowOffset = 0;                 // 效果0 彩虹流
@@ -252,20 +275,21 @@ void resetPresetState() {
   }
 }
 
-// ---- NVS 断电记忆（V2 §5.5）----
-// 单 key 三字段打包（effect/style/mode）。mode 为保留字段：写侧恒写 0、读侧
-// 忽略（C 语义开机恒进预设，mode 不参与恢复；字段保留为未来语义回摆预埋，
-// 回摆零迁移成本）。写点仅 handleButtons 内档位变更处（P1-2 修复后
-// handleButtons 只在窗口外被调，满足"写点窗口门外"冻结纪律）。
+// ---- NVS 断电记忆（V2 §5.5 + M4 亮度档）----
+// 单 key 四字段打包（effect/style/mode/bright）。mode 为保留字段：写侧恒写 0、
+// 读侧忽略（C 语义开机恒进预设，mode 不参与恢复；字段保留为未来语义回摆预埋，
+// 回摆零迁移成本）。写点=handleButtons 内档位变更处 + 亮度模式退出瞬间（稿 §2.3；
+// P1-2 修复后 handleButtons 只在窗口外被调，满足"写点窗口门外"冻结纪律）。
 struct NvState {
   uint8_t effect;   // presetIndex（预设域档位）
   uint8_t style;    // styleIndex（传感器域档位）
   uint8_t mode;     // 保留字段，恒写 0，读侧不使用
+  uint8_t bright;   // brightnessIndex（M4 亮度档；旧 3 字节包无此字段 → 默认档）
 };
 
 void saveImpactState() {
   if (!NVS_ENABLED) return;
-  const NvState s{presetIndex, styleIndex, 0};   // mode 恒写 0（V2 §5.5）
+  const NvState s{presetIndex, styleIndex, 0, brightnessIndex};   // mode 恒写 0（V2 §5.5）
   Preferences prefs;
   prefs.begin(NVS_NS, false);
   prefs.putBytes(NVS_KEY, &s, sizeof(s));
@@ -275,17 +299,25 @@ void saveImpactState() {
 void loadImpactState() {
   presetIndex = 0;
   styleIndex = 0;
+  brightnessIndex = BRIGHT_DEFAULT_INDEX;
   if (!NVS_ENABLED) return;
   Preferences prefs;
   prefs.begin(NVS_NS, true);                     // 只读打开；NVS 不存在时读出空
-  NvState s{0, 0, 0};
-  if (prefs.getBytesLength(NVS_KEY) == sizeof(s)) {
+  NvState s{0, 0, 0, BRIGHT_DEFAULT_INDEX};
+  const size_t storedLen = prefs.getBytesLength(NVS_KEY);
+  if (storedLen == sizeof(NvState)) {            // M4 四字段包
     prefs.getBytes(NVS_KEY, &s, sizeof(s));
+  } else if (storedLen == 3) {                   // M2/M3 旧三字段包：亮度落默认档，效果/花色照常恢复
+    uint8_t legacy[3] = {0, 0, 0};
+    prefs.getBytes(NVS_KEY, legacy, sizeof(legacy));
+    s.effect = legacy[0];
+    s.style = legacy[1];
   }
   prefs.end();
   // 越界回退默认档（冻结纪律）
   presetIndex = (s.effect < PRESET_COUNT) ? s.effect : 0;
   styleIndex = (s.style < STYLE_COUNT) ? s.style : 0;
+  brightnessIndex = (s.bright < BRIGHT_LEVEL_COUNT) ? s.bright : BRIGHT_DEFAULT_INDEX;
 }
 
 // ---- 确认闪 / 提示闪 ----
@@ -302,7 +334,7 @@ bool flashRenderFrame() {
   const uint32_t total = FLASH_PERIOD_MS * flashTimes;
   if (elapsed >= total) {
     flashActive = false;
-    pixels.setBrightness(LED_BRIGHTNESS_MAX);   // 渐灭可能动过全局亮度，恢复
+    pixels.setBrightness(BRIGHT_LEVELS[brightnessIndex]);   // 渐灭可能动过全局亮度，恢复当前档
     return false;
   }
   if (elapsed % FLASH_PERIOD_MS < FLASH_ON_MS) {
@@ -317,7 +349,7 @@ bool flashRenderFrame() {
 // ---- 待机渐灭 ----
 void startStandbyFade() {
   fadeStart = millis();
-  fadeFrom = LED_BRIGHTNESS_MAX;
+  fadeFrom = BRIGHT_LEVELS[brightnessIndex];   // 渐灭起点=当前设定档（稿 §5 渐灭适配）
   fadeActive = true;
 }
 
@@ -358,7 +390,7 @@ void enterSensorMode() {
   fadeActive = false;
   hintStyle = 0xFF;                               // 跨模式残留卫生
   mode = RuntimeMode::Sensor;
-  pixels.setBrightness(LED_BRIGHTNESS_MAX);
+  pixels.setBrightness(BRIGHT_LEVELS[brightnessIndex]);
   clearPixels();                                             // 交接：清灯
   reseedRest();                                              // 32 次静息均值重播种
   piezoRefractUntil = millis() + HANDOVER_SILENCE_MS;        // 交接静默，防头一秒误触发
@@ -371,7 +403,7 @@ void enterPresetMode(bool withFlash = true) {
   fadeActive = false;
   hintStyle = 0xFF;                               // 跨模式残留卫生
   mode = RuntimeMode::Preset;
-  pixels.setBrightness(LED_BRIGHTNESS_MAX);
+  pixels.setBrightness(BRIGHT_LEVELS[brightnessIndex]);
   clearPixels();
   resetPresetState();
   if (withFlash) {
@@ -383,7 +415,128 @@ void enterStandby() {
   mode = RuntimeMode::Standby;
   flashActive = false;                                       // 中止可能在播的确认闪
   hintStyle = 0xFF;                                          // 中止可能在播的提示
-  startStandbyFade();                                        // 从当前亮度 300ms 渐灭
+  startStandbyFade();                                        // 从当前档 300ms 渐灭（M4：起点=当前设定值）
+}
+
+// ---- M4 亮度调节模式（口径稿 v2.1 §2；刻度尺 8/16/24/32 灯 = 50/100/150/200）----
+void drawBrightScale() {
+  pixels.clear();
+  const uint8_t lit = (uint8_t)((brightnessIndex + 1) * LED_COUNT / BRIGHT_LEVEL_COUNT);
+  for (uint8_t i = 0; i < lit; ++i) {
+    pixels.setPixelColor(i, pixels.Color(255, 255, 255));
+  }
+  pixels.show();                                 // 全局亮度=当前档，所见即所得
+}
+
+// 顶格/底格再按：当前刻度 200ms 呼吸提示（稿 §2.2；模式内无引擎无窗口，短暂阻塞安全）
+void brightEdgeHint() {
+  const uint8_t lit = (uint8_t)((brightnessIndex + 1) * LED_COUNT / BRIGHT_LEVEL_COUNT);
+  for (uint8_t f = 0; f < 4; ++f) {
+    pixels.clear();
+    for (uint8_t i = 0; i < lit; ++i) {
+      pixels.setPixelColor(i, dimColor(pixels.Color(255, 255, 255), (uint8_t)(90 + f * 40)));
+    }
+    pixels.show();
+    delay(50);
+  }
+  drawBrightScale();
+}
+
+void enterBrightAdjust() {
+  brightReturnMode = mode;                       // 退出后轻量返回（不清灯/不重播种）
+  mode = RuntimeMode::BrightAdjust;
+  flashActive = false;                           // 中止可能在播的确认闪
+  hintStyle = 0xFF;                              // 跨模式残留卫生
+  pixels.setBrightness(BRIGHT_LEVELS[brightnessIndex]);
+  drawBrightScale();                             // 进模式即显示当前档刻度
+  const uint32_t now = millis();
+  brightLastActionMs = now;
+  brightNextStepMs = now + BRIGHT_REPEAT_MS;     // 手指仍按住：500ms 后开始连发上行
+  brightHoldDir = 1;                             // 入口按住的是 btn1 → 上行连发
+}
+
+// 步进一档（+1 升 / -1 降）；端点停住不回绕（稿 §2.2 定稿点）。返回是否实际换档。
+bool brightStep(int8_t dir) {
+  const int next = (int)brightnessIndex + dir;
+  const uint32_t now = millis();
+  brightLastActionMs = now;
+  brightNextStepMs = now + BRIGHT_REPEAT_MS;
+  if (next < 0 || next >= BRIGHT_LEVEL_COUNT) {
+    return false;
+  }
+  brightnessIndex = (uint8_t)next;
+  pixels.setBrightness(BRIGHT_LEVELS[brightnessIndex]);
+  drawBrightScale();
+  return true;
+}
+
+void exitBrightAdjust() {
+  saveImpactState();                             // §2.3：退出瞬间 NVS 写入一次（快闪=已保存）
+  startFlash(pixels.Color(255, 255, 255), 1);    // 整条白快闪 1 次 = 已保存
+  mode = brightReturnMode;                       // 亮度调节未触碰两域状态，轻量返回
+  if (mode == RuntimeMode::Preset) {
+    lastPresetUpdate = 0;                        // 效果画面闪毕立即恢复
+  }
+  brightHoldDir = 0;
+}
+
+// ---- M4 现场重标定流程（双键同按 500ms 触发；呼吸→进度条→白双闪；非阻塞）----
+// 重采深度（技术裁决，稿 §3.3"已裁决"）：32 次均值按 32 灯进度条节奏展开
+// （40ms/采样 ≈1.28s，比瞬时 3.2ms 重采更抗噪）；不做连窗口校验；
+// M3 无可判失败条件，不设失败分支（稿 §3.2 失败态已同步删除），错误码机制预留。
+void startReseedFlow() {
+  reseedFlowActive = true;
+  reseedPhase = 0;
+  reseedPhaseStart = millis();
+  comboState = ComboState::Flow;                 // 流程中屏蔽一切按键事件（稿 §3.1）
+  Serial.println(F("[ecue] reseed: combo triggered"));
+}
+
+void reseedFlowTick() {
+  const uint32_t now = millis();
+  if (reseedPhase == 0) {                        // 慢呼吸（台呢绿，区别于保存快闪）
+    if (now - reseedPhaseStart >= RESEED_BREATH_MS) {
+      reseedPhase = 1;
+      reseedPhaseStart = now;
+      reseedNextSampleMs = now;
+      reseedSampleCount = 0;
+      reseedSum = 0;
+      pixels.clear();
+      pixels.show();
+    } else {
+      const uint32_t e = (now - reseedPhaseStart) % 400;   // 400ms 三角波
+      const uint8_t pulse = (uint8_t)(e < 200 ? 40 + e : 40 + (400 - e));
+      pixels.fill(dimColor(pixels.Color(0, 150, 70), pulse));
+      pixels.show();
+    }
+    return;
+  }
+  if (reseedPhase == 1) {                        // 进度条：1 灯/采样，32 次均值（语义呼应稿 §3.2）
+    if (now < reseedNextSampleMs) {
+      return;
+    }
+    reseedNextSampleMs = now + RESEED_STEP_MS;
+    if (piezoInWindow) {
+      return;                                    // 撞击窗口内不采样（防污染），顺延一拍
+    }
+    reseedSum += analogRead(PIEZO_ADC_PIN);
+    pixels.setPixelColor(reseedSampleCount, pixels.Color(0, 200, 80));
+    ++reseedSampleCount;
+    pixels.show();
+    if (reseedSampleCount >= LED_COUNT) {
+      piezoRest = (int)(reseedSum / LED_COUNT);  // 与 reseedRest 同口径：32 次均值
+      reseedPhase = 2;
+      reseedPhaseStart = now;
+    }
+    return;
+  }
+  // 阶段 2：满条保持 150ms → 白双闪收尾，回常规显示
+  if (now - reseedPhaseStart >= 150) {
+    reseedFlowActive = false;
+    comboState = ComboState::Cancel;             // 等双键释放回 Idle（吞残余释放事件）
+    startFlash(pixels.Color(255, 255, 255), 2);
+    Serial.printf("[ecue] reseed done: rest=%d\n", piezoRest);
+  }
 }
 
 // ---- 压电引擎（仅传感器模式被调度；窗口期全速采样）----
@@ -991,6 +1144,81 @@ void handleButtons() {
   // 确认闪/渐灭期间按键扫描照常（规范 §2）
   const PressEvent e1 = pollButton(btnEffect);
   const PressEvent e2 = pollButton(btnMode);
+  const bool held1 = btnEffect.rawPressed;
+  const bool held2 = btnMode.rawPressed;
+  const bool press1Edge = held1 && !prevHeld1;   // 按下沿（消抖后）
+  const bool press2Edge = held2 && !prevHeld2;
+  prevHeld1 = held1;
+  prevHeld2 = held2;
+  const uint32_t nowMs = millis();
+
+  // ---- M4 双键同按重标定 FSM（待机/亮度模式内不启用，让位单键语义；稿 §3）----
+  if (mode != RuntimeMode::Standby && mode != RuntimeMode::BrightAdjust) {
+    switch (comboState) {
+      case ComboState::Idle:
+        if (press1Edge && held2 &&
+            nowMs - btnMode.pressStartMs <= BUTTON_COMBO_WINDOW_MS) {
+          comboState = ComboState::Pending;      // 后落键 btn1，btn2 于 150ms 窗内已在按
+          comboStartMs = nowMs;
+        } else if (press2Edge && held1 &&
+                   nowMs - btnEffect.pressStartMs <= BUTTON_COMBO_WINDOW_MS) {
+          comboState = ComboState::Pending;      // 后落键 btn2，btn1 于 150ms 窗内已在按
+          comboStartMs = nowMs;
+        }
+        break;
+      case ComboState::Pending:
+        if (!held1 || !held2) {
+          comboState = ComboState::Cancel;       // 保持失败：作废，不补偿任何单触（稿 §3.1）
+        } else if (nowMs - comboStartMs >= BUTTON_COMBO_HOLD_MS) {
+          startReseedFlow();                     // 同按保持 500ms → 现场重标定
+        }
+        break;
+      case ComboState::Cancel:
+        if (!held1 && !held2) {
+          comboState = ComboState::Idle;         // 双键释放，吞掉的事件到此为止
+        }
+        break;
+      case ComboState::Flow:
+        break;                                   // 流程结束转 Cancel（见 reseedFlowTick）
+    }
+    if (comboState != ComboState::Idle) {
+      return;                                    // 组合期/流程中：屏蔽两键一切单触/长按
+    }
+  }
+
+  // ---- M4 亮度模式内交互（稿 §2.2）：短按按下沿立即步进 + 按住连发；长按/互切/组合全屏蔽 ----
+  if (mode == RuntimeMode::BrightAdjust) {
+    if (press1Edge) {
+      brightHoldDir = 1;
+      if (!brightStep(1)) {
+        brightEdgeHint();                        // 顶格再按：200ms 呼吸提示
+      }
+    }
+    if (press2Edge) {
+      brightHoldDir = -1;
+      if (!brightStep(-1)) {
+        brightEdgeHint();                        // 底格再按：同上（对称设计）
+      }
+    }
+    if (brightHoldDir == 1 && held1 && nowMs >= brightNextStepMs) {
+      if (brightnessIndex < BRIGHT_LEVEL_COUNT - 1) {
+        brightStep(1);                           // 连发上行（进模式延续按住即连发）
+      } else {
+        brightNextStepMs = nowMs + BRIGHT_REPEAT_MS;   // 顶格驻留：停住不回绕
+      }
+    } else if (brightHoldDir == -1 && held2 && nowMs >= brightNextStepMs) {
+      if (brightnessIndex > 0) {
+        brightStep(-1);
+      } else {
+        brightNextStepMs = nowMs + BRIGHT_REPEAT_MS;
+      }
+    }
+    if (!held1 && !held2 &&
+        nowMs - brightLastActionMs >= BRIGHT_IDLE_EXIT_MS) {
+      exitBrightAdjust();                        // 2s 无操作：NVS 保存 + 白快闪 + 轻量返回
+    }
+    return;                                      // 模式内 e1/e2 短按/长按事件全部丢弃
+  }
 
   if (e2 == PressEvent::Long) {                     // btn2 长按：灭灯待机（待机中无效）
     if (mode != RuntimeMode::Standby) {
@@ -1031,8 +1259,17 @@ void handleButtons() {
       }
       saveImpactState();                            // V2 §5.5 写点：档位变更即落 NVS
     }
+    return;
   }
-  // btn1 长按：键位语义预留（M3 现场重标定入口），暂不实现
+
+  if (e1 == PressEvent::Long) {                     // M4：btn1 长按 2s = 亮度模式入口
+    if (mode == RuntimeMode::Standby) {
+      enterSensorMode();                            // 稿 §2.1 待机互斥：只唤醒，不进亮度
+    } else {
+      enterBrightAdjust();                          // 预设/传感器模式 → 亮度调节
+    }
+    return;
+  }
 }
 
 }  // namespace
@@ -1052,7 +1289,7 @@ void cueControllerSetup() {
   }
 
   pixels.begin();
-  pixels.setBrightness(LED_BRIGHTNESS_MAX);         // 亮度帽（§2.6，USB 供电安全值）
+  pixels.setBrightness(BRIGHT_LEVELS[BRIGHT_DEFAULT_INDEX]);   // 先按出厂默认档上电（恢复档经 loadImpactState→enterPresetMode 套用）
   clearPixels();
 
   // V2 §5.6：M1 的上电 64 次静息初始化已移除——开机恒进预设模式，引擎不触达；
@@ -1063,8 +1300,9 @@ void cueControllerSetup() {
   Serial.println();
   Serial.println(F("[ecue] runtime firmware ready (M3)"));
   Serial.println(F("[ecue] boot -> preset mode (C semantics) | NVS restore effect/style"));
-  Serial.printf("[ecue] effect=%u style=%u | LED_BRIGHTNESS_MAX = %u\n",
-                presetIndex, styleIndex, LED_BRIGHTNESS_MAX);
+  Serial.printf("[ecue] effect=%u style=%u bright=%u (idx %u/%u)\n",
+                presetIndex, styleIndex, BRIGHT_LEVELS[brightnessIndex],
+                brightnessIndex, BRIGHT_LEVEL_COUNT);
 
   // C 语义（V2 §5.6）：开机恒进预设灯效模式——enterPresetMode 本体（含全部
   // 入模动作）作为唯一非按键调用点，开机初始化恰一次；无确认闪，灯效即反馈。
@@ -1096,9 +1334,16 @@ void cueControllerLoop() {
     fadeRenderFrame();
     return;
   }
+  if (reseedFlowActive) {
+    reseedFlowTick();                               // M4：重标定流程接管（按键已屏蔽；窗口期不进来）
+    return;
+  }
   if (flashActive) {
     flashRenderFrame();                             // 确认闪优先（细节A：撞击渲染延至闪毕）
     return;
+  }
+  if (mode == RuntimeMode::BrightAdjust) {
+    return;                                         // M4：刻度画面事件驱动（进入/步进时绘制），静置无刷帧
   }
   if (mode == RuntimeMode::Sensor) {
     const bool impactActive = runPiezoEffect();

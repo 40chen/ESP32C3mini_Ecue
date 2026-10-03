@@ -25,6 +25,20 @@ constexpr bool BUTTON_ACTIVE_LOW = true;
 constexpr uint32_t BUTTON_DEBOUNCE_MS = 40;
 constexpr uint32_t BUTTON_LONGPRESS_MS = 2000;
 
+// ---- M4 亮度四档 + 组合键重标定（2026-10-03 拍板链 + 《亮度与重标定-交互口径稿-v2》）----
+// 档位 50/100/150/200（08:11 拍板 4 档；值域 50-200 出自 08:00 拍板，255 标度）。
+// 供电口径（08:00 拍板）：>100 档仅外接 5V≥2A 或电池安全（200 档 32 灯全白 ≈1.5A，
+// USB 500mA 直供必压降）；固件不做供电感知硬钳，USB 直供调试期请停留在 100。
+constexpr uint8_t BRIGHT_LEVEL_COUNT = 4;
+constexpr uint8_t BRIGHT_LEVELS[BRIGHT_LEVEL_COUNT] = {50, 100, 150, 200};
+constexpr uint8_t BRIGHT_DEFAULT_INDEX = 1;      // 出厂默认 100（恰为第 2 档；NVS 无记录/越界回退值）
+constexpr uint32_t BUTTON_COMBO_WINDOW_MS = 150; // 双键同按成立窗：第二键距首键按下 ≤150ms
+constexpr uint32_t BUTTON_COMBO_HOLD_MS = 500;   // 同按保持 ≥500ms 触发现场重标定
+constexpr uint32_t BRIGHT_REPEAT_MS = 500;       // 亮度模式内连发节拍（按住每 500ms 进一档）
+constexpr uint32_t BRIGHT_IDLE_EXIT_MS = 2000;   // 亮度模式内无操作自动退出（退出瞬间 NVS 保存+白快闪）
+constexpr uint32_t RESEED_BREATH_MS = 600;       // 重标定流程：慢呼吸时长
+constexpr uint32_t RESEED_STEP_MS = 40;          // 重采节奏：32 采样 × 40ms ≈ 1.28s（进度条 1 灯/采样）
+
 // ---- 压电引擎（标定程序 piezo_test 与运行时固件共用口径）----
 constexpr uint8_t PIEZO_ADC_PIN = 4;            // ADC1_CH4（勿把 btn1/IO0 加入 ADC 扫描）
 constexpr int PIEZO_TRIGGER = 150;              // 触发阈值（码），约 92mV
@@ -69,4 +83,4 @@ constexpr uint32_t STYLE_HINT_S3_MS = 267;      // S3 单圈波纹（120 灯/s �
 // ---- NVS 断电记忆（V2 §5.5：开机恒进预设模式，仅恢复 effect/style 档位索引）----
 constexpr bool NVS_ENABLED = true;              // false = 纯内存行为（调参期临时关闭用）
 constexpr char NVS_NS[] = "ecue";               // 命名空间
-constexpr char NVS_KEY[] = "state";             // 单 key 三字段打包（effect/style/mode）
+constexpr char NVS_KEY[] = "state";             // 单 key 四字段打包（effect/style/mode/bright；M2/M3 旧三字节包兼容读取）
