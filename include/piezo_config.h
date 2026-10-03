@@ -11,8 +11,8 @@
 // =====================================================================
 
 // ---- 灯条 ----
-constexpr uint8_t LED_PIN = 7;
-constexpr uint8_t LED_COUNT = 32;               // M3：30→32 颗（20261002 拍板）；0-29 与旧版逐位等价，30/31=母球位
+constexpr uint8_t LED_PIN = 6;
+constexpr uint8_t LED_COUNT = 32;            
 // 亮度帽：255=全亮（32 灯约 1.9A，仅外接 5V>=2A 时可用）；100 约 0.75A（USB 直供安全值，32 灯口径）。
 constexpr uint8_t LED_BRIGHTNESS_MAX = 100;
 
