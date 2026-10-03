@@ -76,11 +76,12 @@ PlatformIO 工程（espressif32@6.5.0 / Arduino core 2.0.14 / USB CDC），打�
 
 ## 六、使用流程（标定 → 运行）
 
-1. **压电标定**：`src/main.cpp` 默认编译 `PiezoTest` 观察器（或加
-   `-DAPP_MODE_PIEZO_TEST` 强制），敲击/捏传感器记录串口 CSV 的 `swing` 典型值。
+1. **压电标定**：给 `platformio.ini` 的 build_flags 临时加 `-DAPP_MODE_PIEZO_TEST`
+   重编译（默认编译的是运行时固件，见 `src/main.cpp` 头注），烧录后敲击/捏传感器
+   记录串口 CSV 的 `swing` 典型值。
 2. **填阈值**：`include/piezo_config.h` —— `PIEZO_TRIGGER`（触发，默认 150）、
    `IMPACT_LEVEL1`（600 → 黄）、`IMPACT_LEVEL2`（1500 → 红）。
-3. **切运行固件**：移除该宏重新编译，开机恒进预设灯效模式。
+3. **切运行固件**：移除该宏重新编译（默认即运行时），开机恒进预设灯效模式。
 4. 标定完成后可把 `src/cue_controller.cpp` 的 `DEBUG_IMPACT` 改 `false` 关打印。
 5. **硬件整改警示**：C12 仍为 10pF 时输出贴轨、任何触碰 swing 顶满数千码属预期；
    换 C12=1nF 后幅度缩小约 100 倍，必须重新标定（硬件整改清单见
